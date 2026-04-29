@@ -1,0 +1,107 @@
+clustered_write_bench
+=====================
+
+These scripts measure how well a remembered clustered index survives an
+osm2pgsql-like diff workload.
+
+Run the script against a build with clustered writes:
+
+    psql -v scale=1 -v use_brin=false -f src/tools/clustered_write_bench/osm2pgsql_diff.sql postgres
+
+Larger scale values increase table and diff sizes.  The workload:
+
+* loads a synthetic table keyed by an OSM-like object id and a tile-like
+  clustering key;
+* creates two physically clustered copies of the heap;
+* leaves one copy with remembered clustered-index metadata and clears that
+  metadata on the other copy with `ALTER TABLE ... SET WITHOUT CLUSTER`;
+* records the original heap block range for every tile key;
+* applies a diff with new objects spread across existing tile keys;
+* applies updates to existing objects that enlarge rows enough to force moved
+  heap tuples on a full-ish table, as a regression/stress metric;
+* reports how far inserted and moved tuples drifted from their original tile
+  ranges.
+
+The `clustered_write` variant shows the new placement heuristic.  The
+`without_cluster_metadata` variant is the in-script control: it starts from a
+clustered heap but disables remembered-index placement before the diff.
+Current clustered-write placement is aimed at row insertions; the update rows
+are included to make any accidental moved-update regression obvious.
+If updates look worse for `clustered_write`, that usually means the inserted
+diff rows consumed per-page free space that the later enlarged updates would
+otherwise have used.  That is a real tradeoff to inspect rather than a success
+condition.
+
+The optional `use_brin=true` variable also creates a BRIN index on the tile key.
+Current clustered-write placement does not use BRIN directly: BRIN exposes
+`amgetbitmap`, not `amgettuple`, so it needs a separate bitmap/range candidate
+path.  The option is present to make before/after experiments easy when that
+path is added.
+
+Real osm2pgsql benchmark
+------------------------
+
+`run_osm2pgsql_georgia_bench.sh` runs a larger end-to-end workload against
+PostGIS and osm2pgsql:
+
+    src/tools/clustered_write_bench/run_osm2pgsql_georgia_bench.sh
+
+The script downloads the Geofabrik Georgia extract and the current planet daily
+replication diff, simplifies that daily change file with `osmium merge-changes
+-s` so osm2pgsql sees only the last change for each object id, then measures
+three variants:
+
+* `baseline_stock`: system PostgreSQL without this patch, stock osm2pgsql.
+* `patched_stock`: patched PostgreSQL, stock osm2pgsql.
+* `patched_clustered_import`: patched PostgreSQL and an experimental
+  osm2pgsql build with `--cluster-during-import`.
+
+The write side records `/usr/bin/time -v` output for the initial import and the
+daily diff append.  The read side runs spatial bbox and exact-intersection
+queries from `osm2pgsql_georgia_read.sql`, with `EXPLAIN (ANALYZE, BUFFERS)`,
+and also reports a geohash-to-heap-block locality summary.  All output goes
+under `$WORKDIR/logs` (`$HOME/tmp/clustered-write-osm2pgsql/logs` by default).
+
+Useful overrides:
+
+* `BASELINE_PG_BIN=/path/to/bin` selects the unpatched PostgreSQL build.
+* `PATCHED_PG_BIN=/path/to/bin` selects the patched PostgreSQL build.
+* `STOCK_OSM2PGSQL=/path/to/osm2pgsql` selects stock osm2pgsql.
+* `CLUSTERED_OSM2PGSQL=/path/to/osm2pgsql` selects the experimental osm2pgsql.
+* `OSM2PGSQL_STYLE=/path/to/default.style` selects the pgsql style file.
+* `OSC_URL=https://...osc.gz` pins a specific planet daily diff.
+* `BENCH_VARIANTS=baseline_stock,patched_stock` runs only selected variants.
+
+Only selected variants need their PostgreSQL and osm2pgsql binaries to exist.
+Common input-preparation tools such as curl, osmium, awk, sed, and the
+osm2pgsql style file are still required because the extract and simplified diff
+are shared across variants.
+
+The script copies PostGIS extension SQL and shared libraries into non-system
+PostgreSQL installs before creating the test database.  This keeps the patched
+build usable without installing it globally.
+
+The experimental osm2pgsql variant is not part of PostgreSQL.  For local
+testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
+checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
+adds `--cluster-during-import`, creates a generated geometry-derived geohash key
+and a clustered btree index before the first COPY, and skips osm2pgsql's final
+table rewrite.
+
+Directly clustering the import tables with a pre-COPY GiST index on `way` was
+also tested as a negative control.  It worked functionally, but maintaining the
+GiST index during ingest made the Georgia import and daily append much slower
+than the generated-key path, so the checked-in osm2pgsql experiment keeps the
+btree key while PostgreSQL keeps GiST batch-sort support available for opclasses
+where it is a better fit.
+
+Important output columns:
+
+* `variant`: either the clustered-write path or the in-script control without
+  remembered clustered-index metadata.
+* `pct_inside_base_range`: higher is better; percent of diff tuples still inside
+  the tile's original clustered heap block range.
+* `avg_block_drift`, `p95_block_drift`, `max_block_drift`: lower is better;
+  block distance outside the original tile range.
+* `heap_blocks_touched`: lower can be better for locality, but interpret it
+  with the drift metrics because very small values can also mean hot spots.

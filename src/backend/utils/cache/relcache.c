@@ -4835,6 +4835,7 @@ RelationGetIndexList(Relation relation)
 	char		replident = relation->rd_rel->relreplident;
 	Oid			pkeyIndex = InvalidOid;
 	Oid			candidateIndex = InvalidOid;
+	Oid			clusteredIndex = InvalidOid;
 	bool		pkdeferrable = false;
 	MemoryContext oldcxt;
 
@@ -4875,6 +4876,9 @@ RelationGetIndexList(Relation relation)
 
 		/* add index's OID to result list */
 		result = lappend_oid(result, index->indexrelid);
+
+		if (index->indisclustered)
+			clusteredIndex = index->indexrelid;
 
 		/*
 		 * Non-unique or predicate indexes aren't interesting for either oid
@@ -4928,6 +4932,7 @@ RelationGetIndexList(Relation relation)
 	relation->rd_indexlist = list_copy(result);
 	relation->rd_pkindex = pkeyIndex;
 	relation->rd_ispkdeferrable = pkdeferrable;
+	relation->rd_clusteredindex = clusteredIndex;
 	if (replident == REPLICA_IDENTITY_DEFAULT && OidIsValid(pkeyIndex) && !pkdeferrable)
 		relation->rd_replidindex = pkeyIndex;
 	else if (replident == REPLICA_IDENTITY_INDEX && OidIsValid(candidateIndex))
@@ -5073,6 +5078,27 @@ RelationGetReplicaIndex(Relation relation)
 	}
 
 	return relation->rd_replidindex;
+}
+
+/*
+ * RelationGetClusteredIndex -- get OID of the relation's clustered index
+ *
+ * Returns InvalidOid if there is no such index.
+ */
+Oid
+RelationGetClusteredIndex(Relation relation)
+{
+	List	   *ilist;
+
+	if (!relation->rd_indexvalid)
+	{
+		/* RelationGetIndexList does the heavy lifting. */
+		ilist = RelationGetIndexList(relation);
+		list_free(ilist);
+		Assert(relation->rd_indexvalid);
+	}
+
+	return relation->rd_clusteredindex;
 }
 
 /*
@@ -5302,6 +5328,7 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
 	List	   *newindexoidlist;
 	Oid			relpkindex;
 	Oid			relreplindex;
+	Oid			relclusteredindex;
 	ListCell   *l;
 	MemoryContext oldcxt;
 
@@ -5340,14 +5367,15 @@ restart:
 		return NULL;
 
 	/*
-	 * Copy the rd_pkindex and rd_replidindex values computed by
-	 * RelationGetIndexList before proceeding.  This is needed because a
-	 * relcache flush could occur inside index_open below, resetting the
+	 * Copy the rd_pkindex, rd_replidindex, and rd_clusteredindex values
+	 * computed by RelationGetIndexList before proceeding.  This is needed
+	 * because a relcache flush could occur inside index_open below, resetting the
 	 * fields managed by RelationGetIndexList.  We need to do the work with
 	 * stable values of these fields.
 	 */
 	relpkindex = relation->rd_pkindex;
 	relreplindex = relation->rd_replidindex;
+	relclusteredindex = relation->rd_clusteredindex;
 
 	/*
 	 * For each index, add referenced attributes to indexattrs.
@@ -5480,7 +5508,8 @@ restart:
 	newindexoidlist = RelationGetIndexList(relation);
 	if (equal(indexoidlist, newindexoidlist) &&
 		relpkindex == relation->rd_pkindex &&
-		relreplindex == relation->rd_replidindex)
+		relreplindex == relation->rd_replidindex &&
+		relclusteredindex == relation->rd_clusteredindex)
 	{
 		/* Still the same index set, so proceed */
 		list_free(newindexoidlist);
@@ -6498,6 +6527,7 @@ load_relcache_init_file(bool shared)
 		rel->rd_indexlist = NIL;
 		rel->rd_pkindex = InvalidOid;
 		rel->rd_replidindex = InvalidOid;
+		rel->rd_clusteredindex = InvalidOid;
 		rel->rd_attrsvalid = false;
 		rel->rd_keyattr = NULL;
 		rel->rd_pkattr = NULL;

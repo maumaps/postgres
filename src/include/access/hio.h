@@ -53,7 +53,14 @@ typedef struct BulkInsertStateData
 
 extern void RelationPutHeapTuple(Relation relation, Buffer buffer,
 								 HeapTuple tuple, bool token);
+extern int RelationGetClusteredTargetBlocksFromIndex(Relation relation,
+													 Relation indexRelation,
+													 HeapTuple tuple,
+													 Size len,
+													 BlockNumber *targetBlocks,
+													 int maxTargetBlocks);
 extern Buffer RelationGetBufferForTuple(Relation relation, Size len,
+										HeapTuple tuple,
 										Buffer otherBuffer, uint32 options,
 										BulkInsertStateData *bistate,
 										Buffer *vmbuffer, Buffer *vmbuffer_other,

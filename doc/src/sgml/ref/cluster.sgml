@@ -109,6 +109,18 @@ CLUSTER [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <r
     are periodically reclustered.
    </para>
 
+   <para>
+    When a table has a remembered clustered btree index, later row insertions
+    whose leading clustered key is available try to place new heap tuples near
+    existing heap pages found from that clustered key before falling back to the
+    normal free-space and relation-extension placement rules.  Bulk inserts can
+    also use access-method-specific ordering support, such as GiST sort support,
+    when it is available.  These heuristics reduce how quickly freshly inserted
+    rows drift away from the clustered order, but they are only best-effort;
+    updates, deletes, page-level free space, and concurrent writes can still
+    make periodic reclustering useful.
+   </para>
+
   <para>
     Each backend running <command>CLUSTER</command> will report its progress
     in the <structname>pg_stat_progress_cluster</structname> view. See

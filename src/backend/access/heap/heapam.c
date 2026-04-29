@@ -31,6 +31,9 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/gist.h"
+#include "access/gist_private.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/hio.h"
@@ -40,8 +43,10 @@
 #include "access/valid.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_index.h"
 #include "commands/vacuum.h"
 #include "executor/instrument_node.h"
 #include "pgstat.h"
@@ -53,12 +58,38 @@
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/relcache.h"
+#include "utils/sortsupport.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+
+typedef struct HeapTupleClusteredWriteItem
+{
+	HeapTuple	tuple;
+	BlockNumber targetBlock;
+	Datum		clusterValues[INDEX_MAX_KEYS];
+	bool		clusterIsNull[INDEX_MAX_KEYS];
+	bool		hasClusterKey;
+	int			inputIndex;
+} HeapTupleClusteredWriteItem;
+
+typedef struct HeapTupleClusteredSortContext
+{
+	int			nkeys;
+	SortSupportData sortKeys[INDEX_MAX_KEYS];
+} HeapTupleClusteredSortContext;
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
+static int	heap_clustered_write_item_cmp(const void *a, const void *b, void *arg);
+static bool heap_clustered_write_index_can_sort(Relation relation,
+												Relation indexRelation);
+static int	heap_prepare_clustered_write_sort(Relation relation,
+											  Relation indexRelation,
+											  HeapTupleClusteredWriteItem *items,
+											  int ntuples,
+											  HeapTupleClusteredSortContext *context);
 static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  Buffer newbuf, HeapTuple oldtup,
 								  HeapTuple newtup, HeapTuple old_key_tuple,
@@ -111,6 +142,149 @@ static int	bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
 static HeapTuple ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
 										bool *copy);
+
+static int
+heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
+{
+	const HeapTupleClusteredWriteItem *left = (const HeapTupleClusteredWriteItem *) a;
+	const HeapTupleClusteredWriteItem *right = (const HeapTupleClusteredWriteItem *) b;
+	HeapTupleClusteredSortContext *context = (HeapTupleClusteredSortContext *) arg;
+
+	if (context != NULL && context->nkeys > 0 &&
+		left->hasClusterKey && right->hasClusterKey)
+	{
+		for (int i = 0; i < context->nkeys; i++)
+		{
+			int			compare;
+
+			compare = ApplySortComparator(left->clusterValues[i],
+										  left->clusterIsNull[i],
+										  right->clusterValues[i],
+										  right->clusterIsNull[i],
+										  &context->sortKeys[i]);
+			if (compare != 0)
+				return compare;
+		}
+	}
+	else if (left->hasClusterKey && !right->hasClusterKey)
+		return -1;
+	else if (!left->hasClusterKey && right->hasClusterKey)
+		return 1;
+
+	if (left->targetBlock == InvalidBlockNumber &&
+		right->targetBlock != InvalidBlockNumber)
+		return 1;
+	if (left->targetBlock != InvalidBlockNumber &&
+		right->targetBlock == InvalidBlockNumber)
+		return -1;
+	if (left->targetBlock < right->targetBlock)
+		return -1;
+	if (left->targetBlock > right->targetBlock)
+		return 1;
+
+	return left->inputIndex - right->inputIndex;
+}
+
+static bool
+heap_clustered_write_index_can_sort(Relation relation, Relation indexRelation)
+{
+	int			nkeys;
+
+	if (IsBootstrapProcessingMode() || indexRelation == NULL)
+		return false;
+
+	if (indexRelation->rd_index->indrelid != RelationGetRelid(relation) ||
+		indexRelation->rd_rel->relam != GIST_AM_OID ||
+		!indexRelation->rd_index->indisvalid ||
+		!indexRelation->rd_index->indisready ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indexprs, NULL) ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indpred, NULL))
+		return false;
+
+	nkeys = indexRelation->rd_index->indnkeyatts;
+	if (nkeys <= 0 || nkeys > INDEX_MAX_KEYS)
+		return false;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		if (indexRelation->rd_index->indkey.values[i] <= 0)
+			return false;
+
+		if (!OidIsValid(index_getprocid(indexRelation, i + 1,
+										GIST_SORTSUPPORT_PROC)))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Prepare per-batch ordering by the remembered clustered key.
+ *
+ * GiST opclasses can participate when they provide the sort support function
+ * used by sorted GiST index builds; compress values first so the comparator
+ * sees the same representation as the GiST build tuplesort path.  The
+ * target-block probe remains the fallback for btree and other AMs.
+ */
+static int
+heap_prepare_clustered_write_sort(Relation relation,
+								  Relation indexRelation,
+								  HeapTupleClusteredWriteItem *items,
+								  int ntuples,
+								  HeapTupleClusteredSortContext *context)
+{
+	GISTSTATE  *giststate = NULL;
+	int			nkeys;
+
+	context->nkeys = 0;
+
+	if (!heap_clustered_write_index_can_sort(relation, indexRelation))
+		return 0;
+
+	nkeys = indexRelation->rd_index->indnkeyatts;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		SortSupport sortKey = &context->sortKeys[i];
+
+		memset(sortKey, 0, sizeof(SortSupportData));
+		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_collation = indexRelation->rd_indcollation[i];
+		sortKey->ssup_nulls_first = false;
+		sortKey->ssup_attno = i + 1;
+		sortKey->abbreviate = false;
+
+		PrepareSortSupportFromGistIndexRel(indexRelation, sortKey);
+	}
+
+	giststate = initGISTstate(indexRelation);
+
+	for (int i = 0; i < ntuples; i++)
+	{
+		items[i].hasClusterKey = true;
+
+		for (int key = 0; key < nkeys; key++)
+		{
+			AttrNumber	attnum = indexRelation->rd_index->indkey.values[key];
+
+			items[i].clusterValues[key] =
+				heap_getattr(items[i].tuple, attnum, relation->rd_att,
+							 &items[i].clusterIsNull[key]);
+		}
+
+		gistCompressValues(giststate, indexRelation,
+						   items[i].clusterValues,
+						   items[i].clusterIsNull, true,
+						   items[i].clusterValues);
+	}
+
+	context->nkeys = nkeys;
+	freeGISTstate(giststate);
+
+	return nkeys;
+}
 
 
 /*
@@ -2030,6 +2204,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * this will also pin the requisite visibility map page.
 	 */
 	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
+									   heaptup,
 									   InvalidBuffer, options, bistate,
 									   &vmbuffer, NULL,
 									   0);
@@ -2284,6 +2459,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 {
 	TransactionId xid = GetCurrentTransactionId();
 	HeapTuple  *heaptuples;
+	int		   *heaptuple_slot_indexes = NULL;
 	int			i;
 	int			ndone;
 	PGAlignedBlock scratch;
@@ -2317,6 +2493,92 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		tuple->t_tableOid = slots[i]->tts_tableOid;
 		heaptuples[i] = heap_prepare_insert(relation, tuple, xid, cid,
 											options);
+	}
+
+	/*
+	 * Clustered multi-inserts work best when tuples targeting the same
+	 * already-clustered heap area are adjacent.  Compute candidate blocks
+	 * before entering the critical insertion loop, then keep tuples without a
+	 * clustered-index target in input order behind the clustered groups.
+	 */
+	if ((options & HEAP_INSERT_SKIP_FSM) == 0 && ntuples > 1)
+	{
+		HeapTupleClusteredWriteItem *clustered;
+		HeapTupleClusteredSortContext sortContext;
+		Oid			clusteredIndexOid = InvalidOid;
+		Relation	clusteredIndexRelation = NULL;
+		bool		use_clustered_target_probe = false;
+		bool		use_clustered_sort = false;
+		bool		has_clustered_target = false;
+		bool		has_clustered_sort = false;
+
+		if (!IsBootstrapProcessingMode())
+		{
+			clusteredIndexOid = RelationGetClusteredIndex(relation);
+			if (OidIsValid(clusteredIndexOid))
+				clusteredIndexRelation =
+					try_index_open(clusteredIndexOid, AccessShareLock);
+		}
+		if (clusteredIndexRelation != NULL &&
+			clusteredIndexRelation->rd_rel->relam == BTREE_AM_OID &&
+			heap_attisnull(clusteredIndexRelation->rd_indextuple,
+						   Anum_pg_index_indexprs, NULL))
+			use_clustered_target_probe = true;
+		else if (heap_clustered_write_index_can_sort(relation,
+													 clusteredIndexRelation))
+			use_clustered_sort = true;
+
+		if (use_clustered_target_probe || use_clustered_sort)
+		{
+			clustered = palloc_array(HeapTupleClusteredWriteItem, ntuples);
+			for (i = 0; i < ntuples; i++)
+			{
+				clustered[i].tuple = heaptuples[i];
+				clustered[i].hasClusterKey = false;
+				clustered[i].targetBlock = InvalidBlockNumber;
+				if (use_clustered_target_probe)
+				{
+					BlockNumber targetBlock;
+
+					if (RelationGetClusteredTargetBlocksFromIndex(relation,
+																  clusteredIndexRelation,
+																  heaptuples[i],
+																  heaptuples[i]->t_len,
+																  &targetBlock,
+																  1) > 0)
+						clustered[i].targetBlock = targetBlock;
+				}
+				clustered[i].inputIndex = i;
+				if (clustered[i].targetBlock != InvalidBlockNumber)
+					has_clustered_target = true;
+			}
+
+			if (use_clustered_sort)
+				has_clustered_sort =
+					heap_prepare_clustered_write_sort(relation,
+													  clusteredIndexRelation,
+													  clustered, ntuples,
+													  &sortContext) > 0;
+
+			if (has_clustered_target || has_clustered_sort)
+			{
+				heaptuple_slot_indexes = palloc_array(int, ntuples);
+				qsort_arg(clustered, ntuples,
+						  sizeof(HeapTupleClusteredWriteItem),
+						  heap_clustered_write_item_cmp,
+						  has_clustered_sort ? &sortContext : NULL);
+				for (i = 0; i < ntuples; i++)
+				{
+					heaptuples[i] = clustered[i].tuple;
+					heaptuple_slot_indexes[i] = clustered[i].inputIndex;
+				}
+			}
+
+			pfree(clustered);
+		}
+
+		if (clusteredIndexRelation != NULL)
+			index_close(clusteredIndexRelation, AccessShareLock);
 	}
 
 	/*
@@ -2381,6 +2643,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 * empty page. See all_frozen_set below.
 		 */
 		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
+										   heaptuples[ndone],
 										   InvalidBuffer, options, bistate,
 										   &vmbuffer, NULL,
 										   npages - npages_used);
@@ -2640,8 +2903,17 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	}
 
 	/* copy t_self fields back to the caller's slots */
-	for (i = 0; i < ntuples; i++)
-		slots[i]->tts_tid = heaptuples[i]->t_self;
+	if (heaptuple_slot_indexes != NULL)
+	{
+		for (i = 0; i < ntuples; i++)
+			slots[heaptuple_slot_indexes[i]]->tts_tid = heaptuples[i]->t_self;
+		pfree(heaptuple_slot_indexes);
+	}
+	else
+	{
+		for (i = 0; i < ntuples; i++)
+			slots[i]->tts_tid = heaptuples[i]->t_self;
+	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -3906,6 +4178,7 @@ l2:
 			{
 				/* It doesn't fit, must use RelationGetBufferForTuple. */
 				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
+												   NULL,
 												   buffer, 0, NULL,
 												   &vmbuffer_new, &vmbuffer,
 												   0);

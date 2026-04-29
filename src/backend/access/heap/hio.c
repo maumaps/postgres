@@ -15,14 +15,42 @@
 
 #include "postgres.h"
 
+#include "access/amapi.h"
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/hio.h"
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_index.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "utils/lsyscache.h"
+#include "utils/relcache.h"
+#include "utils/snapmgr.h"
 
+/*
+ * Keep clustered-write placement bounded.  Large duplicate-key ranges can
+ * span many heap pages; probing a small number of distinct candidate pages is
+ * enough to avoid the worst "first equal tuple is on a full page" case without
+ * turning every insert into a long index walk.
+ */
+#define CLUSTERED_WRITE_MAX_INDEX_TIDS		1024
+#define CLUSTERED_WRITE_MAX_HEAP_BLOCKS		32
+
+static bool ClusteredWriteRememberCandidate(Relation relation,
+											BlockNumber nblocks,
+											ItemPointer tid,
+											BlockNumber *candidates,
+											Size *candidateFreeSpace,
+											int *ncandidates);
+static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
+													HeapTuple tuple,
+													Size len,
+													BlockNumber *targetBlocks,
+													int maxTargetBlocks);
 
 /*
  * RelationPutHeapTuple - place tuple at specified page
@@ -77,6 +105,312 @@ RelationPutHeapTuple(Relation relation,
 
 		item->t_ctid = tuple->t_self;
 	}
+}
+
+/*
+ * Remember a distinct heap block found through the clustered index.  The
+ * caller still rechecks page space under the buffer lock before inserting.
+ */
+static bool
+ClusteredWriteRememberCandidate(Relation relation, BlockNumber nblocks,
+								ItemPointer tid, BlockNumber *candidates,
+								Size *candidateFreeSpace, int *ncandidates)
+{
+	BlockNumber candidate;
+
+	if (tid == NULL)
+		return false;
+
+	candidate = ItemPointerGetBlockNumber(tid);
+	if (candidate == InvalidBlockNumber || candidate >= nblocks)
+		return false;
+
+	for (int i = 0; i < *ncandidates; i++)
+	{
+		if (candidates[i] == candidate)
+			return false;
+	}
+
+	candidates[*ncandidates] = candidate;
+	candidateFreeSpace[*ncandidates] = GetRecordedFreeSpace(relation,
+															candidate);
+	(*ncandidates)++;
+
+	return true;
+}
+
+/*
+ * RelationGetClusteredTargetBlocksFromIndex
+ *
+ * For relations with CLUSTER metadata, try to use the clustered index to find
+ * heap blocks that are already close in the relation's clustered order.  A
+ * btree key probe can find equal-key neighbours directly; if the full key has
+ * no matches, shorter left-prefix probes can still find the existing key
+ * group for composite indexes such as (tile_id, osm_id).
+ *
+ * Do not use an unqualified clustered-index scan as an insertion hint.  For
+ * GiST, expression indexes, and btree rows whose leading key is NULL, such a
+ * scan is not anchored to the tuple being inserted and tends to find the same
+ * candidate pages for unrelated tuples.  GiST can still improve multi-inserts
+ * through the batch sort path in heapam.c when the opclass exposes sort
+ * support.
+ *
+ * Partial clustered indexes are rejected by CLUSTER, but guard against them
+ * here anyway in case catalog state is transient or manually corrupted.
+ */
+int
+RelationGetClusteredTargetBlocksFromIndex(Relation relation,
+										  Relation indexRelation,
+										  HeapTuple tuple,
+										  Size len,
+										  BlockNumber *targetBlocks,
+										  int maxTargetBlocks)
+{
+	ScanKeyData skey[INDEX_MAX_KEYS];
+	IndexScanDesc scan;
+	ItemPointer tid;
+	BlockNumber candidates[CLUSTERED_WRITE_MAX_HEAP_BLOCKS];
+	Size		candidateFreeSpace[CLUSTERED_WRITE_MAX_HEAP_BLOCKS];
+	BlockNumber nblocks;
+	int			nkeys;
+	int			nscankeys = 0;
+	int			ntuples = 0;
+	int			ncandidates = 0;
+	int			ntargets = 0;
+	bool		useBtreePrefixProbe = false;
+
+	Assert(maxTargetBlocks > 0);
+
+	if (IsBootstrapProcessingMode() || indexRelation == NULL ||
+		tuple == NULL || len > MaxHeapTupleSize)
+		return 0;
+
+	if (relation->rd_rel->relkind != RELKIND_RELATION &&
+		relation->rd_rel->relkind != RELKIND_MATVIEW)
+		return 0;
+
+	if (indexRelation->rd_index->indrelid != RelationGetRelid(relation) ||
+		indexRelation->rd_rel->relam != BTREE_AM_OID ||
+		!indexRelation->rd_indam->amclusterable ||
+		indexRelation->rd_indam->amgettuple == NULL ||
+		!indexRelation->rd_index->indisvalid ||
+		!indexRelation->rd_index->indisready ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indpred, NULL))
+	{
+		return 0;
+	}
+
+	nkeys = indexRelation->rd_index->indnkeyatts;
+	if (nkeys <= 0 || nkeys > INDEX_MAX_KEYS)
+	{
+		return 0;
+	}
+	nblocks = RelationGetNumberOfBlocks(relation);
+
+	if (heap_attisnull(indexRelation->rd_indextuple,
+					   Anum_pg_index_indexprs, NULL))
+	{
+		useBtreePrefixProbe = true;
+
+		for (int i = 0; i < nkeys; i++)
+		{
+			AttrNumber	attnum = indexRelation->rd_index->indkey.values[i];
+			Datum		value;
+			bool		isnull;
+			Oid			eqOperator;
+			RegProcedure eqProcedure;
+
+			if (attnum <= 0)
+				break;
+
+			value = heap_getattr(tuple, attnum, relation->rd_att, &isnull);
+			if (isnull)
+				break;
+
+			eqOperator = get_opfamily_member(indexRelation->rd_opfamily[i],
+											 indexRelation->rd_opcintype[i],
+											 indexRelation->rd_opcintype[i],
+											 BTEqualStrategyNumber);
+			if (!OidIsValid(eqOperator))
+				break;
+
+			eqProcedure = get_opcode(eqOperator);
+			if (!RegProcedureIsValid(eqProcedure))
+				break;
+
+			ScanKeyInit(&skey[i],
+						i + 1,
+						BTEqualStrategyNumber,
+						eqProcedure,
+						value);
+			nscankeys++;
+		}
+
+		if (nscankeys == 0)
+			useBtreePrefixProbe = false;
+	}
+
+	if (!useBtreePrefixProbe)
+		return 0;
+
+	for (int probeKeys = nscankeys; probeKeys > 0; probeKeys--)
+	{
+		/*
+		 * Plain btree keys can use equality scan keys and retry shorter left
+		 * prefixes.  Unqualified scans are deliberately skipped because they
+		 * are not anchored to the tuple being inserted.
+		 */
+		scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
+							   probeKeys, 0, 0);
+		index_rescan(scan, probeKeys > 0 ? skey : NULL, probeKeys, NULL, 0);
+
+		while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
+		{
+			if (++ntuples > CLUSTERED_WRITE_MAX_INDEX_TIDS)
+				break;
+
+			ClusteredWriteRememberCandidate(relation, nblocks, tid,
+											candidates, candidateFreeSpace,
+											&ncandidates);
+			if (ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+				break;
+		}
+
+		index_endscan(scan);
+
+		if (nscankeys == 0 ||
+			ntuples >= CLUSTERED_WRITE_MAX_INDEX_TIDS ||
+			ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+			break;
+	}
+
+	/*
+	 * A clustered btree can have no equal-key or prefix-key neighbour yet,
+	 * especially while an initially empty clustered index is being maintained
+	 * during COPY.  In that case, try the logical neighbourhood of the leading
+	 * key: the first tuple at or after it, then the first tuple at or before
+	 * it.  That gives brand-new clustered keys a chance to land beside
+	 * adjacent key ranges instead of being appended in input order.
+	 */
+	if (ncandidates == 0 && useBtreePrefixProbe && nscankeys > 0)
+	{
+		ScanKeyData rangeKey;
+		Oid			rangeOperator;
+		RegProcedure rangeProcedure;
+
+		rangeOperator = get_opfamily_member(indexRelation->rd_opfamily[0],
+											indexRelation->rd_opcintype[0],
+											indexRelation->rd_opcintype[0],
+											BTGreaterEqualStrategyNumber);
+		rangeProcedure = OidIsValid(rangeOperator) ?
+			get_opcode(rangeOperator) : InvalidOid;
+		if (RegProcedureIsValid(rangeProcedure))
+		{
+			ScanKeyInit(&rangeKey,
+						1,
+						BTGreaterEqualStrategyNumber,
+						rangeProcedure,
+						skey[0].sk_argument);
+			scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
+								   1, 0, 0);
+			index_rescan(scan, &rangeKey, 1, NULL, 0);
+			tid = index_getnext_tid(scan, ForwardScanDirection);
+			if (tid != NULL)
+			{
+				ClusteredWriteRememberCandidate(relation, nblocks, tid,
+												candidates,
+												candidateFreeSpace,
+												&ncandidates);
+			}
+			index_endscan(scan);
+		}
+
+		rangeOperator = get_opfamily_member(indexRelation->rd_opfamily[0],
+											indexRelation->rd_opcintype[0],
+											indexRelation->rd_opcintype[0],
+											BTLessEqualStrategyNumber);
+		rangeProcedure = OidIsValid(rangeOperator) ?
+			get_opcode(rangeOperator) : InvalidOid;
+		if (RegProcedureIsValid(rangeProcedure) &&
+			ncandidates < CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+		{
+			ScanKeyInit(&rangeKey,
+						1,
+						BTLessEqualStrategyNumber,
+						rangeProcedure,
+						skey[0].sk_argument);
+			scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
+								   1, 0, 0);
+			index_rescan(scan, &rangeKey, 1, NULL, 0);
+			tid = index_getnext_tid(scan, BackwardScanDirection);
+			if (tid != NULL)
+			{
+				ClusteredWriteRememberCandidate(relation, nblocks, tid,
+												candidates,
+												candidateFreeSpace,
+												&ncandidates);
+			}
+			index_endscan(scan);
+		}
+	}
+
+	/*
+	 * Prefer pages whose FSM entry already says they can fit this tuple.  If
+	 * the FSM has no clear winner, try the rest in reverse scan order; that
+	 * keeps us away from the first page of a large equal-key range while
+	 * preserving the normal locked-page free-space recheck in
+	 * RelationGetBufferForTuple().
+	 */
+	for (int i = 0; i < ncandidates && ntargets < maxTargetBlocks; i++)
+	{
+		if (candidateFreeSpace[i] >= len)
+			targetBlocks[ntargets++] = candidates[i];
+	}
+
+	for (int i = ncandidates - 1; i >= 0 && ntargets < maxTargetBlocks; i--)
+	{
+		if (candidateFreeSpace[i] < len)
+			targetBlocks[ntargets++] = candidates[i];
+	}
+
+	return ntargets;
+}
+
+/*
+ * Open the relation's remembered clustered index for callers that only need a
+ * one-off candidate lookup.
+ */
+static int
+RelationGetClusteredTargetBlocksForTuple(Relation relation, HeapTuple tuple,
+										 Size len,
+										 BlockNumber *targetBlocks,
+										 int maxTargetBlocks)
+{
+	Oid			indexOid;
+	Relation	indexRelation;
+	int			ntargets;
+
+	if (IsBootstrapProcessingMode() || tuple == NULL || len > MaxHeapTupleSize)
+		return 0;
+
+	indexOid = RelationGetClusteredIndex(relation);
+	if (!OidIsValid(indexOid))
+		return 0;
+
+	indexRelation = try_index_open(indexOid, AccessShareLock);
+	if (indexRelation == NULL)
+		return 0;
+
+	ntargets = RelationGetClusteredTargetBlocksFromIndex(relation,
+														 indexRelation,
+														 tuple, len,
+														 targetBlocks,
+														 maxTargetBlocks);
+
+	index_close(indexRelation, AccessShareLock);
+
+	return ntargets;
 }
 
 /*
@@ -498,6 +832,7 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
  */
 Buffer
 RelationGetBufferForTuple(Relation relation, Size len,
+						  HeapTuple tuple,
 						  Buffer otherBuffer, uint32 options,
 						  BulkInsertState bistate,
 						  Buffer *vmbuffer, Buffer *vmbuffer_other,
@@ -510,8 +845,12 @@ RelationGetBufferForTuple(Relation relation, Size len,
 				pageFreeSpace = 0,
 				saveFreeSpace = 0,
 				targetFreeSpace = 0;
+	BlockNumber clusteredTargetBlocks[CLUSTERED_WRITE_MAX_HEAP_BLOCKS];
 	BlockNumber targetBlock,
 				otherBlock;
+	int			nclusteredTargetBlocks = 0,
+				clusteredTargetIndex = 0;
+	bool		usingClusteredTarget = false;
 	bool		unlockedTargetBuffer;
 	bool		recheckVmPins;
 
@@ -568,7 +907,24 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	 * When use_fsm is false, we either put the tuple onto the existing target
 	 * page or extend the relation.
 	 */
-	if (bistate && bistate->current_buf != InvalidBuffer)
+	targetBlock = InvalidBlockNumber;
+
+	if (use_fsm)
+	{
+		nclusteredTargetBlocks =
+			RelationGetClusteredTargetBlocksForTuple(relation, tuple, len,
+													 clusteredTargetBlocks,
+													 lengthof(clusteredTargetBlocks));
+		if (nclusteredTargetBlocks > 0)
+			targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+		usingClusteredTarget = (targetBlock != InvalidBlockNumber);
+	}
+
+	if (targetBlock != InvalidBlockNumber)
+	{
+		/* found a clustered-index neighbor */
+	}
+	else if (bistate && bistate->current_buf != InvalidBuffer)
 		targetBlock = BufferGetBlockNumber(bistate->current_buf);
 	else
 		targetBlock = RelationGetTargetBlock(relation);
@@ -698,7 +1054,7 @@ loop:
 		}
 
 		pageFreeSpace = PageGetHeapFreeSpace(page);
-		if (targetFreeSpace <= pageFreeSpace)
+		if ((usingClusteredTarget ? len : targetFreeSpace) <= pageFreeSpace)
 		{
 			/* use this page as future insert target, too */
 			RelationSetTargetBlock(relation, targetBlock);
@@ -721,6 +1077,39 @@ loop:
 		else
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
+		if (usingClusteredTarget)
+		{
+			if (use_fsm)
+				RecordPageWithFreeSpace(relation, targetBlock, pageFreeSpace);
+
+			clusteredTargetIndex++;
+			if (clusteredTargetIndex < nclusteredTargetBlocks)
+			{
+				targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+				continue;
+			}
+
+			usingClusteredTarget = false;
+			if (bistate && bistate->next_free != InvalidBlockNumber)
+			{
+				Assert(bistate->next_free <= bistate->last_free);
+				targetBlock = bistate->next_free;
+				if (bistate->next_free >= bistate->last_free)
+				{
+					bistate->next_free = InvalidBlockNumber;
+					bistate->last_free = InvalidBlockNumber;
+				}
+				else
+					bistate->next_free++;
+			}
+			else if (use_fsm)
+				targetBlock = GetPageWithFreeSpace(relation, targetFreeSpace);
+			else
+				targetBlock = InvalidBlockNumber;
+
+			continue;
+		}
+
 		/* Is there an ongoing bulk extension? */
 		if (bistate && bistate->next_free != InvalidBlockNumber)
 		{
@@ -736,6 +1125,7 @@ loop:
 				RecordPageWithFreeSpace(relation, targetBlock, pageFreeSpace);
 
 			targetBlock = bistate->next_free;
+			usingClusteredTarget = false;
 			if (bistate->next_free >= bistate->last_free)
 			{
 				bistate->next_free = InvalidBlockNumber;
@@ -755,10 +1145,14 @@ loop:
 			 * Update FSM as to condition of this page, and ask for another
 			 * page to try.
 			 */
-			targetBlock = RecordAndGetPageWithFreeSpace(relation,
-														targetBlock,
-														pageFreeSpace,
-														targetFreeSpace);
+			if (targetBlock == InvalidBlockNumber)
+				targetBlock = GetPageWithFreeSpace(relation, targetFreeSpace);
+			else
+				targetBlock = RecordAndGetPageWithFreeSpace(relation,
+															targetBlock,
+															pageFreeSpace,
+															targetFreeSpace);
+			usingClusteredTarget = false;
 		}
 	}
 

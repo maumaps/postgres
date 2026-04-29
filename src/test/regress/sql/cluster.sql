@@ -103,11 +103,69 @@ WHERE pg_class.oid=indexrelid
 	AND pg_class_2.relname = 'clstr_tst'
 	AND indisclustered;
 
+-- Verify that clustered writes prefer heap blocks in clustered key order.
+CREATE TABLE clstr_write_btree (id int, k int, filler text) WITH (fillfactor = 10);
+INSERT INTO clstr_write_btree
+SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_btree_k_id ON clstr_write_btree (k, id);
+CLUSTER clstr_write_btree USING clstr_write_btree_k_id;
+INSERT INTO clstr_write_btree VALUES (1001, 1, repeat('y', 10));
+SELECT tid_block(new_row.ctid) <=
+	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id <> 1001)
+	AS placed_near_clustered_key
+FROM clstr_write_btree AS new_row
+WHERE id = 1001;
+DROP TABLE clstr_write_btree;
+
+-- Verify that reordered clustered COPY batches keep each slot's TID.
+CREATE TABLE clstr_write_copy_tid (id int, k int, filler text) WITH (fillfactor = 10);
+INSERT INTO clstr_write_copy_tid
+SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_copy_tid_k_id ON clstr_write_copy_tid (k, id);
+CREATE INDEX clstr_write_copy_tid_id ON clstr_write_copy_tid (id);
+CLUSTER clstr_write_copy_tid USING clstr_write_copy_tid_k_id;
+COPY clstr_write_copy_tid (id, k, filler) FROM stdin;
+2001	2	y
+1001	1	y
+2002	2	y
+1002	1	y
+\.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id FROM (
+	SELECT id FROM clstr_write_copy_tid WHERE id = 1001
+	UNION ALL
+	SELECT id FROM clstr_write_copy_tid WHERE id = 1002
+	UNION ALL
+	SELECT id FROM clstr_write_copy_tid WHERE id = 2001
+	UNION ALL
+	SELECT id FROM clstr_write_copy_tid WHERE id = 2002
+) AS indexed_lookup
+ORDER BY id;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+DROP TABLE clstr_write_copy_tid;
+
+-- Verify that clustered writes do not break other clusterable AMs.
+CREATE TABLE clstr_write_gist (id int, p point, filler text) WITH (fillfactor = 50);
+INSERT INTO clstr_write_gist
+SELECT g, point(g, g), repeat('x', 1000)
+FROM generate_series(1, 20) AS g;
+CREATE INDEX clstr_write_gist_p ON clstr_write_gist USING gist (p);
+CLUSTER clstr_write_gist USING clstr_write_gist_p;
+INSERT INTO clstr_write_gist VALUES (1001, point(1.5, 1.5), repeat('y', 1000));
+SELECT count(*) AS rows, count(*) FILTER (WHERE p <@ box(point(1, 1), point(2, 2))) AS nearby
+FROM clstr_write_gist;
+DROP TABLE clstr_write_gist;
+
 -- Verify that toast tables are clusterable
 CLUSTER pg_toast.pg_toast_826 USING pg_toast_826_index;
 
 -- Verify that clustering all tables does in fact cluster the right ones
 CREATE USER regress_clstr_user;
+GRANT CREATE ON SCHEMA public TO regress_clstr_user;
 CREATE TABLE clstr_1 (a INT PRIMARY KEY);
 CREATE TABLE clstr_2 (a INT PRIMARY KEY);
 CREATE TABLE clstr_3 (a INT PRIMARY KEY);
@@ -441,4 +499,5 @@ DROP TABLE clstr_4;
 DROP TABLE clstr_expression;
 DROP TABLE clstrpart;
 
+REVOKE CREATE ON SCHEMA public FROM regress_clstr_user;
 DROP USER regress_clstr_user;
