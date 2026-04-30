@@ -44,7 +44,7 @@ index 6b250a6..4b38667 100644
  }
 
 diff --git a/src/table.cpp b/src/table.cpp
-index 6b65eb9..a79332e 100644
+index 6b65eb9..581428a 100644
 --- a/src/table.cpp
 +++ b/src/table.cpp
 @@ -27,10 +27,11 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
@@ -128,7 +128,7 @@ index 6b65eb9..a79332e 100644
          if (m_srid != "4326") {
              create_geom_check_trigger(*m_db_connection, m_target->schema(),
                                        m_target->name(), "ST_IsValid(NEW.way)");
-@@ -190,17 +227,48 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
+@@ -190,17 +227,52 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
                                      m_target->name());
          }
 
@@ -141,13 +141,17 @@ index 6b65eb9..a79332e 100644
 -            fmt::format("CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
 -                        qual_tmp_name, m_table_space, qual_name);
 +            std::string const sql = fmt::format(
-+                "CREATE TABLE {} WITH (autovacuum_enabled = off, "
-+                "fillfactor = 90) {} AS SELECT * FROM {} "
-+                "ORDER BY osm2pgsql_cluster_key, osm_id",
-+                qual_tmp_name, m_table_space, qual_name);
++                "CREATE TABLE {} (LIKE {} INCLUDING GENERATED) "
++                "WITH (autovacuum_enabled = off, fillfactor = 90) {}",
++                qual_tmp_name, qual_name, m_table_space);
 
 -        m_db_connection->exec(sql);
 +            m_db_connection->exec(sql);
++            m_db_connection->exec(
++                "INSERT INTO {} ({}) SELECT {} FROM {} "
++                "ORDER BY osm2pgsql_cluster_key, osm_id",
++                qual_tmp_name, m_target->rows(), m_target->rows(),
++                qual_name);
 +
 +            m_db_connection->exec("DROP TABLE {}", qual_name);
 +            m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")",

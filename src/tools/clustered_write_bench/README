@@ -148,7 +148,7 @@ with locally built PostGIS `3.7.0dev`.
 | patched_stock | 2:54.12 | 2:41.17 | 2728 MB |
 | patched_clustered_import, no heap fillfactor reserve | 2:10.09 | 2:22.13 | 2776 MB |
 | patched_clustered_import, heap fillfactor 90 | 1:21.37 | 2:00.01 | 2780 MB |
-| patched_clustered_import, final rewrite by generated key | 2:08.24 | 1:54.96 | 2830 MB |
+| patched_clustered_import, generated-preserving rewrite by key | 1:36.92 | 2:29.90 | 2829 MB |
 
 Read/locality summary from the same run:
 
@@ -158,7 +158,7 @@ Read/locality summary from the same run:
 | patched_stock | 267.111 ms | 2381.184 ms | 1144.408 ms | 99.757 ms | 2215.158 ms | 9645.548 ms | 7 / 2381 | 6 / 1002 | 32 / 1208 |
 | patched_clustered_import, no heap fillfactor reserve | 332.595 ms | 631.841 ms | 972.157 ms | 98.546 ms | 1576.143 ms | 6123.307 ms | 13 / 15394 | 16 / 2207 | 10 / 20402 |
 | patched_clustered_import, heap fillfactor 90 | 226.063 ms | 619.446 ms | 1040.034 ms | 135.411 ms | 1716.965 ms | 6396.165 ms | 9 / 15396.5 | 13 / 2212 | 9 / 20314.5 |
-| patched_clustered_import, final rewrite by generated key | 162.437 ms | 643.238 ms | 1040.441 ms | 215.840 ms | 1142.027 ms | 5606.016 ms | 7 / 2592 | 6 / 1135 | 33 / 1344.5 |
+| patched_clustered_import, generated-preserving rewrite by key | 208.438 ms | 666.939 ms | 1336.187 ms | 266.315 ms | 4152.334 ms | 7671.920 ms | 4 / 2362.25 | 4 / 1097 | 9 / 1289 |
 
 The current result is mixed rather than a victory lap: the patched run keeps
 append time roughly flat and improves the exact polygon/roads reads in this
@@ -177,23 +177,30 @@ the long p95 heap span while the initial COPY stream stayed unordered, and
 `pg_stats.correlation` for `osm2pgsql_cluster_key` stayed low or negative
 (`line=-0.0757`, `point=-0.2435`, `polygon=-0.6679`, `roads=-0.0230`).
 
-Rewriting the final heap by `osm2pgsql_cluster_key, osm_id` fixed that
-diagnosis: correlation became `1` for point, line, polygon, and roads, while
-p95 span returned close to the stock geometry-clustered baseline.  The cost is
-a real table rewrite and a slightly larger database, so this is best read as
-the correctness/performance target for a future global or external sort before
-COPY rather than as proof that the pre-COPY btree alone is enough.  Small
-bounded in-memory COPY sort windows were tested after this point and rejected:
-they lowered or raised initial import time depending on the window, but left
-`osm2pgsql_cluster_key` correlation poor and made diff append much slower.
+Rewriting the final heap by `osm2pgsql_cluster_key, osm_id` fixed the heap-span
+diagnosis, but the first `CREATE TABLE AS SELECT *` prototype silently turned
+the generated key into a plain text column.  The checked-in experiment now
+rebuilds the final heap with `CREATE TABLE ... LIKE ... INCLUDING GENERATED`
+and ordered `INSERT`, so later diff rows keep computing the key.  A catalog
+check after append confirmed all four OSM tables still have stored generated
+`osm2pgsql_cluster_key` columns and zero NULL keys.  This is a correctness win
+with a mixed timing profile: initial import is faster than the CTAS prototype
+and append remains faster than the stock baseline, but exact polygon reads were
+noisier/slower in this single run.  The cost is still a real table rewrite, so
+this is best read as the correctness/performance target for a future global or
+external sort before COPY rather than as proof that the pre-COPY btree alone is
+enough.  Small bounded in-memory COPY sort windows were tested after this point
+and rejected: they lowered or raised initial import time depending on the
+window, but left `osm2pgsql_cluster_key` correlation poor and made diff append
+much slower.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
 checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
 adds `--cluster-during-import`, creates a generated geometry-derived geohash key
 and a clustered btree index before the first COPY, creates the heap with
-`fillfactor=90`, rewrites the loaded heap by that key, and restores the
-clustered btree marker before diff append.
+`fillfactor=90`, rewrites the loaded heap by that key while preserving the
+generated column, and restores the clustered btree marker before diff append.
 
 Directly clustering the import tables with a pre-COPY GiST index on `way` was
 also tested as a negative control.  It worked functionally, but maintaining the
@@ -285,6 +292,12 @@ Do not repeat these paths blindly:
   repair correlation (`line≈0`, `point=-0.1958`, `polygon=-0.6488`,
   `roads=0.4155`).  The copy stream needs a global/external sort, not this
   small micro-sort.
+* **CTAS final rewrite for the generated-key osm2pgsql experiment:** rejected
+  as a correctness shape even though it had the best single-run append timing
+  (`1:54.96`).  `CREATE TABLE AS SELECT *` does not preserve the generated
+  column, so later append rows would stop computing `osm2pgsql_cluster_key`.
+  The checked-in experiment uses `LIKE ... INCLUDING GENERATED` plus ordered
+  `INSERT` instead.
 * **One-opened-index-per-`heap_multi_insert` batch as a simplification:** kept
   out as a performance change because the single Georgia rerun did not beat
   the prior generated-geohash result (`1:59.29` create, `1:56.57` append).
