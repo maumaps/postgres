@@ -205,6 +205,11 @@ Do not repeat these paths blindly:
   tried to skip equality work for COPY batches shaped like one long duplicate
   prefix followed by a small useful tail, but the scale `1` single-key run made
   hot `0.9` and `1.0` slower while locality stayed unchanged.
+* **Open-addressed by-value prefix cache:** rejected.  Handling hash collisions
+  precisely looked cleaner than the direct-mapped cache, but the scale `1`
+  temp-instance run made single-key insert timings worse (`780.29 ms`,
+  `1677.95 ms`, and `1294.90 ms` for hot `0`, `0.9`, and `1.0`) while the
+  locality summary stayed unchanged.
 * **Btree batch sorting before target probes:** rejected on the real Georgia
   osm2pgsql run (`3:14.39` create, `4:08.59` append).  For this workload,
   btree target-page probing beats sorting the batch first.
