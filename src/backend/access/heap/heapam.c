@@ -2530,6 +2530,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	HeapTuple  *heaptuples;
 	int		   *heaptuple_slot_indexes = NULL;
 	BlockNumber *heaptuple_clustered_target_blocks = NULL;
+	bool		heaptuple_skip_clustered_target_lookup = false;
 	int			i;
 	int			ndone;
 	PGAlignedBlock scratch;
@@ -2594,6 +2595,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		int			prefixTargetCacheSize = 0;
 		int			prefixCountCacheSize = 0;
 		int			prefixTargetCacheMask = 0;
+		int			hotPrefixTupleCount = 0;
 
 		if (!IsBootstrapProcessingMode())
 		{
@@ -2747,150 +2749,173 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 							prefixCountSlots[i] = cacheSlot;
 						}
 					}
+
+					if (prefixCountCache != NULL)
+					{
+						int			ncountSlots = usePrefixHashCache ?
+							prefixTargetCacheLimit : prefixCountCacheSize;
+
+						for (i = 0; i < ncountSlots; i++)
+						{
+							if (prefixCountCache[i].occupied &&
+								prefixCountCache[i].ntuples >
+								CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES)
+								hotPrefixTupleCount +=
+									prefixCountCache[i].ntuples;
+						}
+					}
 				}
 			}
 
-			clustered = palloc_array(HeapTupleClusteredWriteItem, ntuples);
-			for (i = 0; i < ntuples; i++)
+			if (use_clustered_target_probe &&
+				prefixCountCache != NULL &&
+				hotPrefixTupleCount == ntuples)
 			{
-				clustered[i].tuple = heaptuples[i];
-				clustered[i].hasClusterKey = false;
-				clustered[i].targetBlock = InvalidBlockNumber;
-				if (use_clustered_target_probe)
+				heaptuple_skip_clustered_target_lookup = true;
+				clustered = NULL;
+			}
+			else
+			{
+				clustered = palloc_array(HeapTupleClusteredWriteItem, ntuples);
+				for (i = 0; i < ntuples; i++)
 				{
-					BlockNumber targetBlock;
-					Datum		prefixValue = (Datum) 0;
-					bool		prefixIsNull = true;
-					bool		foundCachedTarget = false;
-					bool		skipClusteredTargetProbe = false;
-					int			prefixCacheSlot = -1;
-
-					if (prefixTargetCache != NULL)
+					clustered[i].tuple = heaptuples[i];
+					clustered[i].hasClusterKey = false;
+					clustered[i].targetBlock = InvalidBlockNumber;
+					if (use_clustered_target_probe)
 					{
-						if (prefixCountSlots != NULL &&
-							prefixCountSlots[i] >= 0)
-						{
-							int			countSlot = prefixCountSlots[i];
+						BlockNumber targetBlock;
+						Datum		prefixValue = (Datum) 0;
+						bool		prefixIsNull = true;
+						bool		foundCachedTarget = false;
+						bool		skipClusteredTargetProbe = false;
+						int			prefixCacheSlot = -1;
 
-							skipClusteredTargetProbe =
-								prefixCountCache[countSlot].ntuples >
-								CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES;
-						}
-
-						if (!skipClusteredTargetProbe)
+						if (prefixTargetCache != NULL)
 						{
-							prefixValue =
-								heap_getattr(heaptuples[i],
-											 prefixCacheAttnum,
-											 relation->rd_att,
-											 &prefixIsNull);
-						}
-						if (!prefixIsNull && !skipClusteredTargetProbe)
-						{
-							int			ncacheEntries;
-
-							if (usePrefixHashCache)
+							if (prefixCountSlots != NULL &&
+								prefixCountSlots[i] >= 0)
 							{
-								uint32		prefixHash;
+								int			countSlot = prefixCountSlots[i];
 
-								prefixHash = hash_bytes((unsigned char *) &prefixValue,
-														sizeof(Datum));
-								prefixCacheSlot =
-									prefixHash & prefixTargetCacheMask;
-								ncacheEntries =
-									prefixTargetCache[prefixCacheSlot].occupied ?
-									1 : 0;
+								skipClusteredTargetProbe =
+									prefixCountCache[countSlot].ntuples >
+									CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES;
 							}
-							else
-								ncacheEntries = prefixTargetCacheSize;
 
-							for (int j = 0; j < ncacheEntries; j++)
+							if (!skipClusteredTargetProbe)
 							{
-								bool		equal;
-								MemoryContext oldcontext;
-								int			cacheSlot;
+								prefixValue =
+									heap_getattr(heaptuples[i],
+												 prefixCacheAttnum,
+												 relation->rd_att,
+												 &prefixIsNull);
+							}
+							if (!prefixIsNull && !skipClusteredTargetProbe)
+							{
+								int			ncacheEntries;
 
-								cacheSlot = usePrefixHashCache ?
-									prefixCacheSlot : j;
-
-								oldcontext =
-									MemoryContextSwitchTo(prefixCacheCompareCxt);
-								equal =
-									DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
-																	  prefixCacheCollation,
-																	  prefixTargetCache[cacheSlot].prefixValue,
-																	  prefixValue));
-								MemoryContextSwitchTo(oldcontext);
-								MemoryContextReset(prefixCacheCompareCxt);
-
-								if (equal)
+								if (usePrefixHashCache)
 								{
-									clustered[i].targetBlock =
-										prefixTargetCache[cacheSlot].targetBlock;
-									foundCachedTarget = true;
-									break;
+									uint32		prefixHash;
+
+									prefixHash = hash_bytes((unsigned char *) &prefixValue,
+															sizeof(Datum));
+									prefixCacheSlot =
+										prefixHash & prefixTargetCacheMask;
+									ncacheEntries =
+										prefixTargetCache[prefixCacheSlot].occupied ?
+										1 : 0;
+								}
+								else
+									ncacheEntries = prefixTargetCacheSize;
+
+								for (int j = 0; j < ncacheEntries; j++)
+								{
+									bool		equal;
+									MemoryContext oldcontext;
+									int			cacheSlot;
+
+									cacheSlot = usePrefixHashCache ?
+										prefixCacheSlot : j;
+
+									oldcontext =
+										MemoryContextSwitchTo(prefixCacheCompareCxt);
+									equal =
+										DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																		  prefixCacheCollation,
+																		  prefixTargetCache[cacheSlot].prefixValue,
+																		  prefixValue));
+									MemoryContextSwitchTo(oldcontext);
+									MemoryContextReset(prefixCacheCompareCxt);
+
+									if (equal)
+									{
+										clustered[i].targetBlock =
+											prefixTargetCache[cacheSlot].targetBlock;
+										foundCachedTarget = true;
+										break;
+									}
 								}
 							}
 						}
-					}
-					if (skipClusteredTargetProbe)
-						has_skipped_clustered_target_probe = true;
+						if (skipClusteredTargetProbe)
+							has_skipped_clustered_target_probe = true;
 
-					if (!foundCachedTarget && !skipClusteredTargetProbe)
-					{
-						if (RelationGetClusteredTargetBlocksFromIndex(relation,
-																	  clusteredIndexRelation,
-																	  heaptuples[i],
-																	  heaptuples[i]->t_len,
-																	  &targetBlock,
-																	  1,
-																	  true) > 0)
-							clustered[i].targetBlock = targetBlock;
-
-						if (prefixTargetCache != NULL && !prefixIsNull)
+						if (!foundCachedTarget && !skipClusteredTargetProbe)
 						{
-							int			cacheSlot;
+							if (RelationGetClusteredTargetBlocksFromIndex(relation,
+																		  clusteredIndexRelation,
+																		  heaptuples[i],
+																		  heaptuples[i]->t_len,
+																		  &targetBlock,
+																		  1,
+																		  true) > 0)
+								clustered[i].targetBlock = targetBlock;
 
-							if (usePrefixHashCache)
-								cacheSlot = prefixCacheSlot;
-							else
+							if (prefixTargetCache != NULL && !prefixIsNull)
 							{
-								Assert(prefixTargetCacheSize <
-									   prefixTargetCacheLimit);
-								cacheSlot = prefixTargetCacheSize++;
-							}
+								int			cacheSlot;
 
-							prefixTargetCache[cacheSlot].prefixValue =
-								prefixValue;
-							prefixTargetCache[cacheSlot].targetBlock =
-								clustered[i].targetBlock;
-							prefixTargetCache[cacheSlot].occupied = true;
+								if (usePrefixHashCache)
+									cacheSlot = prefixCacheSlot;
+								else
+								{
+									Assert(prefixTargetCacheSize <
+										   prefixTargetCacheLimit);
+									cacheSlot = prefixTargetCacheSize++;
+								}
+
+								prefixTargetCache[cacheSlot].prefixValue =
+									prefixValue;
+								prefixTargetCache[cacheSlot].targetBlock =
+									clustered[i].targetBlock;
+								prefixTargetCache[cacheSlot].occupied = true;
+							}
 						}
 					}
+					clustered[i].inputIndex = i;
+					if (clustered[i].targetBlock != InvalidBlockNumber)
+						has_clustered_target = true;
 				}
-				clustered[i].inputIndex = i;
-				if (clustered[i].targetBlock != InvalidBlockNumber)
-					has_clustered_target = true;
 			}
 
-			if (use_clustered_sort)
+			if (use_clustered_sort && clustered != NULL)
 				has_clustered_sort =
 					heap_prepare_clustered_write_sort(relation,
 													  clusteredIndexRelation,
 													  clustered, ntuples,
 													  &sortContext) > 0;
 
-			if (has_clustered_target || has_clustered_sort ||
-				has_skipped_clustered_target_probe)
+			if (has_clustered_target || has_clustered_sort)
 			{
 				heaptuple_slot_indexes = palloc_array(int, ntuples);
 				heaptuple_clustered_target_blocks =
 					palloc_array(BlockNumber, ntuples);
-				if (has_clustered_target || has_clustered_sort)
-					qsort_arg(clustered, ntuples,
-							  sizeof(HeapTupleClusteredWriteItem),
-							  heap_clustered_write_item_cmp,
-							  has_clustered_sort ? &sortContext : NULL);
+				qsort_arg(clustered, ntuples,
+						  sizeof(HeapTupleClusteredWriteItem),
+						  heap_clustered_write_item_cmp,
+						  has_clustered_sort ? &sortContext : NULL);
 				for (i = 0; i < ntuples; i++)
 				{
 					heaptuples[i] = clustered[i].tuple;
@@ -2901,10 +2926,24 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				if (sortContext.sortCxt != NULL)
 					MemoryContextDelete(sortContext.sortCxt);
 			}
+			else if (has_skipped_clustered_target_probe)
+			{
+				/*
+				 * Dense equal-prefix batches intentionally skipped the
+				 * precomputed clustered target probe.  Keep the actual insert
+				 * on the regular bulk/FSM path too, without materializing a
+				 * per-tuple InvalidBlockNumber array solely to suppress lazy
+				 * clustered lookups in RelationGetBufferForTuple().
+				 */
+				heaptuple_skip_clustered_target_lookup = true;
+				if (sortContext.sortCxt != NULL)
+					MemoryContextDelete(sortContext.sortCxt);
+			}
 			else if (sortContext.sortCxt != NULL)
 				MemoryContextDelete(sortContext.sortCxt);
 
-			pfree(clustered);
+			if (clustered != NULL)
+				pfree(clustered);
 			if (prefixTargetCache != NULL)
 			{
 				pfree(prefixCountSlots);
@@ -2981,7 +3020,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 * Also pin visibility map page if COPY FREEZE inserts tuples into an
 		 * empty page. See all_frozen_set below.
 		 */
-		if (heaptuple_clustered_target_blocks != NULL)
+		if (heaptuple_skip_clustered_target_lookup)
+			clustered_target_tuple = NULL;
+		else if (heaptuple_clustered_target_blocks != NULL)
 		{
 			clustered_target_block =
 				heaptuple_clustered_target_blocks[ndone];
