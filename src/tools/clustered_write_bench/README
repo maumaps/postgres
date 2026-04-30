@@ -135,6 +135,69 @@ than the generated-key path, so the checked-in osm2pgsql experiment keeps the
 btree key while PostgreSQL keeps GiST batch-sort support available for opclasses
 where it is a better fit.
 
+Rejected experiments
+--------------------
+
+This branch intentionally keeps a record of negative results.  Clustered heap
+placement has several tempting local optimizations that look obvious in code
+review but lose either locality, write time, or both when replayed through the
+synthetic and osm2pgsql workloads.
+
+Do not repeat these paths blindly:
+
+* **Eager all-candidates precomputation per tuple:** rejected because the
+  multi-insert preparation path only needs a preferred first block.  Computing
+  the full bounded target-page list before the insertion loop moved too much
+  index work onto every tuple.  The kept design does a cheap first-candidate
+  batch probe and leaves the full bounded candidate window for the lazy
+  full-page fallback in `RelationGetBufferForTuple()`.
+* **Repointing the rest of a batch after a preferred page is full:** rejected
+  on hot duplicate-key smokes.  It did not produce a useful locality gain and
+  made scale `0.1` hot-tile insert timings worse.
+* **Taking the backward btree edge during cheap first-candidate probes:**
+  rejected for the same reason.  The backward edge is still useful for the
+  lazy full bounded search, but doing it during the cheap batch precompute
+  made the common path pay for duplicate-key defence too early.
+* **Target-run skipping and prefix-hit caps:** rejected while attacking the hot
+  duplicate-key cliff.  Both variants were slower on hot-prefix scale `0.1`
+  smokes without fixing the poor forced-hot-row locality.
+* **Bounded FIFO prefix cache:** rejected because it destroyed the synthetic
+  composite-prefix locality.  Clustered insert locality fell to `0%` inside the
+  base range, so the cache must not evict the exact prefix information needed
+  by the current COPY batch.
+* **Removing skip-only target arrays / relying on lazy clustered lookup:**
+  rejected because it reintroduced expensive per-tuple clustered-index probes
+  in fully hot batches.  In the scale `1`, hot `1.0` check this path was around
+  `2016 ms`, far worse than the kept skip-only suppression path.
+* **Target-block-only skip without preserving slot remapping:** rejected after
+  scale `1`, hot `1.0` checks stayed above `2100 ms`.  The slot remapping is
+  also correctness-sensitive for COPY index maintenance and triggers.
+* **Early leading-prefix whole-batch skip:** rejected because the quick
+  shortcut looked attractive for duplicate keys but made hot `1.0` scale `0.1`
+  slower in practice.
+* **Early all-equal hot-prefix shortcut before cache allocation:** rejected
+  after the disk-pressure recovery run.  It increased hot `0.9`/`1.0` scale
+  `0.1` insert timings in smoke runs without changing locality.
+* **Datum equality fast-path for integer/OID prefixes:** rejected for now.  Even
+  though integer `Datum` equality is semantically safe for the tested built-in
+  types, the extra branch did not help the workload; hot `0.9` and `1.0` smoke
+  timings got worse while locality stayed unchanged.
+* **Btree batch sorting before target probes:** rejected on the real Georgia
+  osm2pgsql run (`3:14.39` create, `4:08.59` append).  For this workload,
+  btree target-page probing beats sorting the batch first.
+* **Pre-COPY clustered GiST index on `way`:** rejected as an osm2pgsql import
+  strategy.  It worked functionally, but GiST maintenance during ingest was
+  too expensive (`4:53.68` create, `5:30.27` append in the Georgia run).
+* **One-opened-index-per-`heap_multi_insert` batch as a simplification:** kept
+  out as a performance change because the single Georgia rerun did not beat
+  the prior generated-geohash result (`1:59.29` create, `1:56.57` append).
+
+The useful lesson from the rejected hot-prefix work is that duplicate-key
+batches need either a genuinely local page-selection policy for the repeated
+key or a very cheap decision to stop spending clustered-write work on that key.
+Adding more eager probes or more per-tuple branching has repeatedly moved the
+cost curve in the wrong direction.
+
 Important output columns:
 
 * `brin_enabled`: whether the optional BRIN index was present for this run.
