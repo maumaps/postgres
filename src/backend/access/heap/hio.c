@@ -59,7 +59,8 @@ static void ClusteredWriteRememberPrefixCandidates(Relation relation,
 												   Size *candidateFreeSpace,
 												   int *ncandidates,
 												   int *ntuples,
-												   int tupleLimit);
+												   int tupleLimit,
+												   int candidateLimit);
 static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
 													HeapTuple tuple,
 													Size len,
@@ -229,13 +230,16 @@ ClusteredWriteRememberPrefixCandidates(Relation relation,
 									   Size *candidateFreeSpace,
 									   int *ncandidates,
 									   int *ntuples,
-									   int tupleLimit)
+									   int tupleLimit,
+									   int candidateLimit)
 {
 	IndexScanDesc scan;
 	ItemPointer tid;
 
 	Assert(nscankeys > 0);
 	Assert(tupleLimit > 0);
+	Assert(candidateLimit > 0);
+	Assert(candidateLimit <= CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
 
 	scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
 						   nscankeys, 0, 0);
@@ -250,7 +254,7 @@ ClusteredWriteRememberPrefixCandidates(Relation relation,
 		ClusteredWriteRememberCandidate(relation, nblocks, tid,
 										candidates, candidateFreeSpace,
 										ncandidates);
-		if (*ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+		if (*ncandidates >= candidateLimit)
 			break;
 	}
 
@@ -346,6 +350,8 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 
 	for (int probeKeys = nscankeys; probeKeys > 0; probeKeys--)
 	{
+		int			forwardCandidateLimit;
+		int			remainingCandidates;
 		int			remainingTuples;
 		int			forwardLimit;
 
@@ -356,21 +362,26 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		 * heap pages.  Unqualified scans are deliberately skipped because
 		 * they are not anchored to the tuple being inserted.
 		 */
+		remainingCandidates = CLUSTERED_WRITE_MAX_HEAP_BLOCKS - ncandidates;
 		remainingTuples = CLUSTERED_WRITE_MAX_INDEX_TIDS - ntuples;
-		if (remainingTuples <= 0)
+		if (remainingCandidates <= 0 || remainingTuples <= 0)
 			break;
 
 		/*
-		 * Reserve roughly half the remaining TID budget for the backward scan
-		 * so a very large range cannot spend the whole budget at its head.
+		 * Reserve roughly half the remaining TID and candidate-page budgets
+		 * for the backward scan, so a very large range cannot spend all of
+		 * either budget at its head.
 		 */
+		forwardCandidateLimit = ncandidates +
+			Max(1, remainingCandidates / 2);
 		forwardLimit = ntuples + Max(1, remainingTuples / 2);
 		ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
 											   nblocks, skey, probeKeys,
 											   ForwardScanDirection,
 											   candidates, candidateFreeSpace,
 											   &ncandidates, &ntuples,
-											   forwardLimit);
+											   forwardLimit,
+											   forwardCandidateLimit);
 
 		/*
 		 * The backward edge is only needed when the forward edge did not find
@@ -388,7 +399,8 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 												   candidates,
 												   candidateFreeSpace,
 												   &ncandidates, &ntuples,
-												   CLUSTERED_WRITE_MAX_INDEX_TIDS);
+												   CLUSTERED_WRITE_MAX_INDEX_TIDS,
+												   CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
 
 		if (ntuples >= CLUSTERED_WRITE_MAX_INDEX_TIDS ||
 			ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
