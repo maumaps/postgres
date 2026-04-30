@@ -103,8 +103,8 @@ WHERE pg_class.oid=indexrelid
 	AND pg_class_2.relname = 'clstr_tst'
 	AND indisclustered;
 
--- Verify that clustered writes do not consume fillfactor reserve when the
--- clustered key's existing pages are below the normal insert threshold.
+-- Verify that clustered writes may use one fillfactor-reserve neighbor for a
+-- clustered key, but repeated equal-prefix overflow is redirected to the tail.
 CREATE TABLE clstr_write_btree (id int, k int, filler text) WITH (fillfactor = 10);
 INSERT INTO clstr_write_btree
 SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
@@ -112,11 +112,13 @@ FROM generate_series(1, 400) AS g;
 CREATE INDEX clstr_write_btree_k_id ON clstr_write_btree (k, id);
 CLUSTER clstr_write_btree USING clstr_write_btree_k_id;
 INSERT INTO clstr_write_btree VALUES (1001, 1, repeat('y', 10));
-SELECT tid_block(new_row.ctid) <=
-	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id <> 1001)
+INSERT INTO clstr_write_btree VALUES (1002, 1, repeat('y', 10));
+SELECT id, tid_block(new_row.ctid) <=
+	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id NOT IN (1001, 1002))
 	AS used_clustered_key_reserve
 FROM clstr_write_btree AS new_row
-WHERE id = 1001;
+WHERE id IN (1001, 1002)
+ORDER BY id;
 DROP TABLE clstr_write_btree;
 
 -- Verify that reordered clustered COPY batches keep each slot's TID.

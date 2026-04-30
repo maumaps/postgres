@@ -40,17 +40,24 @@
  */
 #define CLUSTERED_WRITE_MAX_INDEX_TIDS		1024
 #define CLUSTERED_WRITE_MAX_HEAP_BLOCKS		32
+#define CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES 32
 #define CLUSTERED_WRITE_CACHE_MAGIC			0x48435743	/* HCWC */
 
-typedef struct HeapClusteredWriteCache
+typedef struct HeapClusteredWriteOverflowEntry
 {
-	uint32		magic;
-	bool		overflowActive;
+	bool		active;
 	AttrNumber	overflowAttnum;
 	Oid			overflowCollation;
 	RegProcedure overflowEqProc;
 	Datum		overflowValue;
 	BlockNumber overflowTargetBlock;
+} HeapClusteredWriteOverflowEntry;
+
+typedef struct HeapClusteredWriteCache
+{
+	uint32		magic;
+	int			overflowNextEntry;
+	HeapClusteredWriteOverflowEntry overflowEntries[CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES];
 } HeapClusteredWriteCache;
 
 static bool ClusteredWriteRememberCandidate(Relation relation,
@@ -555,6 +562,18 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		if (candidateFreeSpace[i] >= len)
 			targetBlocks[ntargets++] = candidates[i];
 	}
+	if (ntargets == 0)
+	{
+		/*
+		 * CLUSTER can leave useful reserve space on heap pages before the FSM
+		 * has a matching entry.  Return the bounded neighbour list anyway and
+		 * let RelationGetBufferForTuple() recheck the actual page space under
+		 * lock; long equal-prefix runs are redirected through the overflow cache
+		 * once they consume one below-fillfactor neighbour.
+		 */
+		for (int i = 0; i < ncandidates && ntargets < maxTargetBlocks; i++)
+			targetBlocks[ntargets++] = candidates[i];
+	}
 
 	if (ntargets == 0 && ncandidates > 0 &&
 		clusteredCandidatesExhausted != NULL)
@@ -595,30 +614,39 @@ ClusteredWriteGetCachedOverflowTarget(Relation relation, HeapTuple tuple,
 	HeapClusteredWriteCache *cache;
 	Datum		prefixValue;
 	bool		prefixIsNull;
-	bool		equal;
 
 	cache = (HeapClusteredWriteCache *) relation->rd_amcache;
 	if (cache == NULL ||
 		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC ||
-		!cache->overflowActive ||
-		!BlockNumberIsValid(cache->overflowTargetBlock) ||
 		tuple == NULL)
 		return false;
 
-	prefixValue = heap_getattr(tuple, cache->overflowAttnum,
-							   relation->rd_att, &prefixIsNull);
-	if (prefixIsNull)
-		return false;
+	for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
+	{
+		HeapClusteredWriteOverflowEntry *entry = &cache->overflowEntries[i];
+		bool		equal;
 
-	equal = DatumGetBool(OidFunctionCall2Coll(cache->overflowEqProc,
-											  cache->overflowCollation,
-											  cache->overflowValue,
-											  prefixValue));
-	if (!equal)
-		return false;
+		if (!entry->active ||
+			!BlockNumberIsValid(entry->overflowTargetBlock))
+			continue;
 
-	*targetBlock = cache->overflowTargetBlock;
-	return true;
+		prefixValue = heap_getattr(tuple, entry->overflowAttnum,
+								   relation->rd_att, &prefixIsNull);
+		if (prefixIsNull)
+			continue;
+
+		equal = DatumGetBool(OidFunctionCall2Coll(entry->overflowEqProc,
+												  entry->overflowCollation,
+												  entry->overflowValue,
+												  prefixValue));
+		if (!equal)
+			continue;
+
+		*targetBlock = entry->overflowTargetBlock;
+		return true;
+	}
+
+	return false;
 }
 
 static void
@@ -688,12 +716,54 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 	cache = ClusteredWriteGetCache(relation);
 	if (cache != NULL)
 	{
-		cache->overflowActive = true;
-		cache->overflowAttnum = attnum;
-		cache->overflowCollation = indexRelation->rd_indcollation[0];
-		cache->overflowEqProc = eqProc;
-		cache->overflowValue = prefixValue;
-		cache->overflowTargetBlock = targetBlock;
+		HeapClusteredWriteOverflowEntry *entry = NULL;
+		int			insertAt;
+
+		for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
+		{
+			bool		equal;
+
+			entry = &cache->overflowEntries[i];
+			if (!entry->active ||
+				entry->overflowAttnum != attnum ||
+				entry->overflowCollation != indexRelation->rd_indcollation[0] ||
+				entry->overflowEqProc != eqProc)
+				continue;
+
+			equal = DatumGetBool(OidFunctionCall2Coll(entry->overflowEqProc,
+													  entry->overflowCollation,
+													  entry->overflowValue,
+													  prefixValue));
+			if (equal)
+				break;
+			entry = NULL;
+		}
+
+		if (entry == NULL)
+		{
+			for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
+			{
+				if (!cache->overflowEntries[i].active)
+				{
+					entry = &cache->overflowEntries[i];
+					break;
+				}
+			}
+		}
+
+		if (entry == NULL)
+		{
+			insertAt = cache->overflowNextEntry++ %
+				CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES;
+			entry = &cache->overflowEntries[insertAt];
+		}
+
+		entry->active = true;
+		entry->overflowAttnum = attnum;
+		entry->overflowCollation = indexRelation->rd_indcollation[0];
+		entry->overflowEqProc = eqProc;
+		entry->overflowValue = prefixValue;
+		entry->overflowTargetBlock = targetBlock;
 	}
 
 	index_close(indexRelation, AccessShareLock);
@@ -707,11 +777,14 @@ ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
 
 	cache = (HeapClusteredWriteCache *) relation->rd_amcache;
 	if (cache == NULL ||
-		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC ||
-		!cache->overflowActive)
+		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC)
 		return;
 
-	cache->overflowTargetBlock = targetBlock;
+	for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
+	{
+		if (cache->overflowEntries[i].active)
+			cache->overflowEntries[i].overflowTargetBlock = targetBlock;
+	}
 }
 
 /*
@@ -1189,6 +1262,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	Buffer		buffer = InvalidBuffer;
 	Page		page;
 	Size		nearlyEmptyFreeSpace,
+				clusteredTargetFreeSpace = 0,
 				pageFreeSpace = 0,
 				saveFreeSpace = 0,
 				targetFreeSpace = 0;
@@ -1238,6 +1312,9 @@ RelationGetBufferForTuple(Relation relation, Size len,
 		targetFreeSpace = Max(len, nearlyEmptyFreeSpace);
 	else
 		targetFreeSpace = len + saveFreeSpace;
+	clusteredTargetFreeSpace =
+		(saveFreeSpace > 0 && targetFreeSpace == len + saveFreeSpace) ?
+		len : targetFreeSpace;
 
 	if (otherBuffer != InvalidBuffer)
 		otherBlock = BufferGetBlockNumber(otherBuffer);
@@ -1283,7 +1360,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 			{
 				nclusteredTargetBlocks =
 					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
-															 targetFreeSpace,
+															 clusteredTargetFreeSpace,
 															 clusteredTargetBlocks,
 															 lengthof(clusteredTargetBlocks),
 															 &clusteredCandidatesExhausted);
@@ -1442,10 +1519,29 @@ loop:
 		}
 
 		pageFreeSpace = PageGetHeapFreeSpace(page);
-		if (targetFreeSpace <= pageFreeSpace)
+		if (targetFreeSpace <= pageFreeSpace ||
+			(usingClusteredTarget && len <= pageFreeSpace))
 		{
-			/* use this page as future insert target, too */
-			RelationSetTargetBlock(relation, targetBlock);
+			if (targetFreeSpace <= pageFreeSpace)
+			{
+				/* use this page as future insert target, too */
+				RelationSetTargetBlock(relation, targetBlock);
+			}
+			else
+			{
+				BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
+
+				/*
+				 * Let a clustered write use one below-fillfactor neighbor,
+				 * then redirect more equal-prefix overflow to the relation
+				 * tail.  This keeps rare keys near their cluster without
+				 * spraying long duplicate-key runs through reserve space.
+				 */
+				RelationSetTargetBlock(relation, InvalidBlockNumber);
+				if (tuple != NULL && nblocks > 0)
+					ClusteredWriteRememberOverflowTarget(relation, tuple,
+														 nblocks - 1);
+			}
 			return buffer;
 		}
 
@@ -1484,7 +1580,7 @@ loop:
 				usingPreferredBlock = false;
 				nclusteredTargetBlocks =
 					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
-															 targetFreeSpace,
+															 clusteredTargetFreeSpace,
 															 clusteredTargetBlocks,
 															 lengthof(clusteredTargetBlocks),
 															 &clusteredCandidatesExhausted);
