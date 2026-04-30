@@ -614,6 +614,25 @@ Do not repeat these paths blindly:
   `/home/kom/tmp/clustered-write-synthetic/reuse-prefix-hash-slot-copy-20260501-031244/`
   and
   `/home/kom/tmp/clustered-write-synthetic/reuse-prefix-hash-slot-text-unordered-rerun-20260501-031521/`.
+* **Skipping the clustered COPY qsort when target blocks are already ordered:**
+  rejected.  The prototype detected whether the precomputed btree target blocks
+  were already in the same order as the clustered multi-insert comparator, and
+  skipped `qsort_arg()` in that case while keeping invalid targets after valid
+  ones.  A scale `1`, repeat `3` COPY matrix looked broadly promising, with
+  seven of eight clustered COPY medians improving or staying near the kept
+  same-target-packing result (`ff50` integer unordered `376.68 ms` to
+  `306.69 ms`, `ff90` text unordered `324.91 ms` to `229.77 ms`), but
+  fillfactor `90` integer unordered already regressed.  The focused repeat `6`
+  fillfactor `90` recheck confirmed the shortcut was not stable: integer
+  unordered/ordered regressed to `287.08/277.57 ms` from `212.44/220.67 ms`,
+  and text ordered regressed to `350.14 ms` from `257.94 ms`; only text
+  unordered improved (`324.91 ms` to `287.65 ms`).  The code experiment was
+  reverted, `tmp_install` was rebuilt from the clean branch, and a tiny
+  post-revert COPY smoke passed.  Raw gzip outputs are under
+  `/home/kom/tmp/clustered-write-synthetic/skip-presorted-target-qsort-copy-20260501-032018/`,
+  `/home/kom/tmp/clustered-write-synthetic/skip-presorted-target-qsort-ff90-rerun-20260501-032243/`,
+  and
+  `/home/kom/tmp/clustered-write-synthetic/post-qsort-skip-clean-copy-smoke-20260501-032659/`.
 * **Raising COPY's buffered byte limit to reach the tuple limit:** rejected.
   The idea was to let clustered COPY batches get closer to the existing
   `1000`-tuple cap instead of flushing around `65535` bytes, giving the
