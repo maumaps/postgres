@@ -35,6 +35,16 @@
 \set order_diff_by_cluster_key false
 \endif
 
+\if :{?copy_diff_from_file}
+\else
+\set copy_diff_from_file false
+\endif
+
+\if :{?diff_copy_path}
+\else
+\set diff_copy_path '/tmp/clustered_write_diff_inserts.tsv'
+\endif
+
 \timing on
 
 drop table if exists clustered_write_osm_diff cascade;
@@ -51,7 +61,8 @@ select (200000 * :scale)::int as base_rows,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
-       (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key;
+       (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
+       (:'copy_diff_from_file')::boolean as copy_diff_from_file;
 
 create unlogged table clustered_write_osm_diff_on
 (
@@ -166,7 +177,8 @@ select (200000 * :scale)::int as base_rows,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
-       (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key;
+       (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
+       (:'copy_diff_from_file')::boolean as copy_diff_from_file;
 
 create temp table clustered_write_step_timings
 (
@@ -202,9 +214,34 @@ select s.base_rows + g as osm_id,
 from clustered_write_settings as s,
      generate_series(1, s.insert_rows) as g;
 
+\if :copy_diff_from_file
+\if :order_diff_by_cluster_key
+copy (
+    select d.osm_id,
+           d.tile_id,
+           1 as version,
+           repeat('insert', 16) as payload
+    from clustered_write_diff_inserts as d
+    order by d.tile_id, d.osm_id
+) to :'diff_copy_path' with (format csv, delimiter E'\t');
+\else
+copy (
+    select d.osm_id,
+           d.tile_id,
+           1 as version,
+           repeat('insert', 16) as payload
+    from clustered_write_diff_inserts as d
+) to :'diff_copy_path' with (format csv, delimiter E'\t');
+\endif
+\endif
+
 insert into clustered_write_step_timings
 values ('clustered_write_insert', clock_timestamp(), null);
 
+\if :copy_diff_from_file
+copy clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
+from :'diff_copy_path' with (format csv, delimiter E'\t');
+\else
 \if :order_diff_by_cluster_key
 insert into clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
 select d.osm_id,
@@ -221,6 +258,7 @@ select d.osm_id,
        repeat('insert', 16)
 from clustered_write_diff_inserts as d;
 \endif
+\endif
 
 update clustered_write_step_timings
 set finished_at = clock_timestamp()
@@ -229,6 +267,10 @@ where step = 'clustered_write_insert';
 insert into clustered_write_step_timings
 values ('without_cluster_metadata_insert', clock_timestamp(), null);
 
+\if :copy_diff_from_file
+copy clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
+from :'diff_copy_path' with (format csv, delimiter E'\t');
+\else
 \if :order_diff_by_cluster_key
 insert into clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
 select d.osm_id,
@@ -244,6 +286,7 @@ select d.osm_id,
        1,
        repeat('insert', 16)
 from clustered_write_diff_inserts as d;
+\endif
 \endif
 
 update clustered_write_step_timings
@@ -287,6 +330,7 @@ analyze clustered_write_osm_diff_off;
 select s.brin_enabled,
        s.text_cluster_key,
        s.heap_fillfactor,
+       s.copy_diff_from_file,
        t.step,
        round((extract(epoch from t.finished_at - t.started_at) * 1000)::numeric, 2) as elapsed_ms
 from clustered_write_step_timings as t
@@ -378,6 +422,7 @@ drift as
 select s.brin_enabled,
        s.text_cluster_key,
        s.heap_fillfactor,
+       s.copy_diff_from_file,
        variant,
        diff_kind,
        count(*) as rows_measured,
@@ -394,5 +439,7 @@ select s.brin_enabled,
        max(block_drift) as max_block_drift
 from drift
 join clustered_write_settings as s on true
-group by s.brin_enabled, s.text_cluster_key, s.heap_fillfactor, variant, diff_kind
-order by s.brin_enabled, s.text_cluster_key, s.heap_fillfactor, variant, diff_kind;
+group by s.brin_enabled, s.text_cluster_key, s.heap_fillfactor,
+         s.copy_diff_from_file, variant, diff_kind
+order by s.brin_enabled, s.text_cluster_key, s.heap_fillfactor,
+         s.copy_diff_from_file, variant, diff_kind;

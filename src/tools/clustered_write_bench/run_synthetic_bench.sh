@@ -18,6 +18,7 @@ TEXT_KEY_VALUES=${TEXT_KEY_VALUES:-"false"}
 HOT_TILE_FRACTION_VALUES=${HOT_TILE_FRACTION_VALUES:-"0"}
 HEAP_FILLFACTOR_VALUES=${HEAP_FILLFACTOR_VALUES:-"90"}
 ORDER_DIFF_BY_CLUSTER_KEY_VALUES=${ORDER_DIFF_BY_CLUSTER_KEY_VALUES:-"false"}
+COPY_DIFF_FROM_FILE_VALUES=${COPY_DIFF_FROM_FILE_VALUES:-"false"}
 OUTDIR=${OUTDIR:-"$HOME/tmp/clustered-write-synthetic/$(date +%Y%m%d-%H%M%S)"}
 COMPRESS_RAW=${COMPRESS_RAW:-true}
 KEEP_TEMP_INSTANCE_DATA=${KEEP_TEMP_INSTANCE_DATA:-false}
@@ -46,6 +47,7 @@ mkdir -p "$OUTDIR/raw"
 	printf 'hot_tile_fraction_values: %s\n' "$HOT_TILE_FRACTION_VALUES"
 	printf 'heap_fillfactor_values: %s\n' "$HEAP_FILLFACTOR_VALUES"
 	printf 'order_diff_by_cluster_key_values: %s\n' "$ORDER_DIFF_BY_CLUSTER_KEY_VALUES"
+	printf 'copy_diff_from_file_values: %s\n' "$COPY_DIFF_FROM_FILE_VALUES"
 	printf 'compress_raw: %s\n' "$COMPRESS_RAW"
 	printf 'keep_temp_instance_data: %s\n' "$KEEP_TEMP_INSTANCE_DATA"
 	printf 'uname: '
@@ -93,8 +95,8 @@ locality_tsv="$OUTDIR/locality.tsv"
 timing_summary_tsv="$OUTDIR/timing_summary.tsv"
 locality_summary_tsv="$OUTDIR/locality_summary.tsv"
 
-printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tstep\telapsed_ms\n' >"$timings_tsv"
-printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\theap_block_span\toutside_base_heap_block_span\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
+printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tcopy_diff_from_file\tstep\telapsed_ms\n' >"$timings_tsv"
+printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tcopy_diff_from_file\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\theap_block_span\toutside_base_heap_block_span\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
 
 for scale in $SCALE_VALUES; do
 	for brin in $BRIN_VALUES; do
@@ -103,60 +105,72 @@ for scale in $SCALE_VALUES; do
 				for heap_fillfactor in $HEAP_FILLFACTOR_VALUES; do
 					for hot_tile_fraction in $HOT_TILE_FRACTION_VALUES; do
 						for order_diff_by_cluster_key in $ORDER_DIFF_BY_CLUSTER_KEY_VALUES; do
-							for run in $(seq 1 "$REPEATS"); do
-								raw="$OUTDIR/raw/scale-${scale}_brin-${brin}_single-key-${single_key}_text-key-${text_cluster_key}_fillfactor-${heap_fillfactor}_hot-tile-${hot_tile_fraction}_order-diff-${order_diff_by_cluster_key}_run-${run}.out"
+							for copy_diff_from_file in $COPY_DIFF_FROM_FILE_VALUES; do
+								for run in $(seq 1 "$REPEATS"); do
+									raw="$OUTDIR/raw/scale-${scale}_brin-${brin}_single-key-${single_key}_text-key-${text_cluster_key}_fillfactor-${heap_fillfactor}_hot-tile-${hot_tile_fraction}_order-diff-${order_diff_by_cluster_key}_copy-${copy_diff_from_file}_run-${run}.out"
+									diff_copy_path="${raw%.out}.copy.tsv"
 
-								"$PSQL" -X -v ON_ERROR_STOP=1 \
-									-v scale="$scale" \
-									-v use_brin="$brin" \
-									-v single_key_cluster="$single_key" \
-									-v text_cluster_key="$text_cluster_key" \
-									-v heap_fillfactor="$heap_fillfactor" \
-									-v hot_tile_fraction="$hot_tile_fraction" \
-									-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
-									-d "$DBNAME" >"$raw" <<SQL
+									if ! "$PSQL" -X -v ON_ERROR_STOP=1 \
+										-v scale="$scale" \
+										-v use_brin="$brin" \
+										-v single_key_cluster="$single_key" \
+										-v text_cluster_key="$text_cluster_key" \
+										-v heap_fillfactor="$heap_fillfactor" \
+										-v hot_tile_fraction="$hot_tile_fraction" \
+										-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
+										-v copy_diff_from_file="$copy_diff_from_file" \
+										-v diff_copy_path="$diff_copy_path" \
+										-d "$DBNAME" >"$raw" <<SQL
 \\pset format unaligned
 \\pset border 0
 \\pset footer off
 \\pset pager off
 \\i $SCRIPT_DIR/osm2pgsql_diff.sql
 SQL
+									then
+										rm -f "$diff_copy_path"
+										exit 1
+									fi
+									rm -f "$diff_copy_path"
 
-								awk -F'|' \
-									-v run="$run" \
-									-v scale="$scale" \
-									-v brin="$brin" \
-									-v single_key="$single_key" \
-									-v text_cluster_key="$text_cluster_key" \
-									-v heap_fillfactor="$heap_fillfactor" \
-									-v hot_tile_fraction="$hot_tile_fraction" \
-									-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
-									'$4 == "clustered_write_insert" ||
-									 $4 == "clustered_write_update" ||
-									 $4 == "without_cluster_metadata_insert" ||
-									 $4 == "without_cluster_metadata_update" {
-										printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-											run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, order_diff_by_cluster_key, $4, $5
-									}' "$raw" >>"$timings_tsv"
+									awk -F'|' \
+										-v run="$run" \
+										-v scale="$scale" \
+										-v brin="$brin" \
+										-v single_key="$single_key" \
+										-v text_cluster_key="$text_cluster_key" \
+										-v heap_fillfactor="$heap_fillfactor" \
+										-v hot_tile_fraction="$hot_tile_fraction" \
+										-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
+										-v copy_diff_from_file="$copy_diff_from_file" \
+										'$5 == "clustered_write_insert" ||
+										 $5 == "clustered_write_update" ||
+										 $5 == "without_cluster_metadata_insert" ||
+										 $5 == "without_cluster_metadata_update" {
+											printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+												run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, order_diff_by_cluster_key, copy_diff_from_file, $5, $6
+										}' "$raw" >>"$timings_tsv"
 
-								awk -F'|' \
-									-v run="$run" \
-									-v scale="$scale" \
-									-v brin="$brin" \
-									-v single_key="$single_key" \
-									-v text_cluster_key="$text_cluster_key" \
-									-v heap_fillfactor="$heap_fillfactor" \
-									-v hot_tile_fraction="$hot_tile_fraction" \
-									-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
-									'$4 == "clustered_write" ||
-									 $4 == "without_cluster_metadata" {
-										printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-											run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, order_diff_by_cluster_key, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
-									}' "$raw" >>"$locality_tsv"
+									awk -F'|' \
+										-v run="$run" \
+										-v scale="$scale" \
+										-v brin="$brin" \
+										-v single_key="$single_key" \
+										-v text_cluster_key="$text_cluster_key" \
+										-v heap_fillfactor="$heap_fillfactor" \
+										-v hot_tile_fraction="$hot_tile_fraction" \
+										-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
+										-v copy_diff_from_file="$copy_diff_from_file" \
+										'$5 == "clustered_write" ||
+										 $5 == "without_cluster_metadata" {
+											printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+												run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, order_diff_by_cluster_key, copy_diff_from_file, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+										}' "$raw" >>"$locality_tsv"
 
-								if [[ "$COMPRESS_RAW" == "true" ]]; then
-									gzip -f "$raw"
-								fi
+									if [[ "$COMPRESS_RAW" == "true" ]]; then
+										gzip -f "$raw"
+									fi
+								done
 							done
 						done
 					done
@@ -171,19 +185,20 @@ awk -F'\t' '
 		OFS = "\t"
 		print "scale", "brin_enabled", "single_key_cluster",
 		      "text_cluster_key", "heap_fillfactor", "hot_tile_fraction",
-		      "order_diff_by_cluster_key", "step", "runs",
+		      "order_diff_by_cluster_key", "copy_diff_from_file",
+		      "step", "runs",
 		      "avg_elapsed_ms", "median_elapsed_ms", "min_elapsed_ms",
 		      "max_elapsed_ms"
 	}
 	NR > 1 {
-		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9
-		sum[key] += $10
+		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9 OFS $10
+		sum[key] += $11
 		count[key]++
-		sample[key, count[key]] = $10
-		if (!(key in min) || $10 < min[key])
-			min[key] = $10
-		if (!(key in max) || $10 > max[key])
-			max[key] = $10
+		sample[key, count[key]] = $11
+		if (!(key in min) || $11 < min[key])
+			min[key] = $11
+		if (!(key in max) || $11 > max[key])
+			max[key] = $11
 	}
 	END {
 		for (key in count) {
@@ -212,7 +227,7 @@ awk -F'\t' '
 ' "$timings_tsv" >"$timing_summary_tsv"
 {
 	head -n 1 "$timing_summary_tsv"
-	tail -n +2 "$timing_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4 -k5,5n -k6,6V -k7,7 -k8,8
+	tail -n +2 "$timing_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4 -k5,5n -k6,6V -k7,7 -k8,8 -k9,9
 } >"$timing_summary_tsv.tmp"
 mv "$timing_summary_tsv.tmp" "$timing_summary_tsv"
 
@@ -221,18 +236,19 @@ awk -F'\t' '
 		OFS = "\t"
 		print "scale", "brin_enabled", "single_key_cluster",
 		      "text_cluster_key", "heap_fillfactor", "hot_tile_fraction",
-		      "order_diff_by_cluster_key", "variant", "diff_kind", "runs",
+		      "order_diff_by_cluster_key", "copy_diff_from_file",
+		      "variant", "diff_kind", "runs",
 		      "avg_heap_block_span", "avg_outside_base_heap_block_span",
 		      "avg_pct_inside_base_range",
 		      "avg_block_drift", "avg_p95_block_drift"
 	}
 	NR > 1 {
-		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9 OFS $10
-		span[key] += $13
-		outside_span[key] += $14
-		pct[key] += $15
-		avg[key] += $16
-		p95[key] += $17
+		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9 OFS $10 OFS $11
+		span[key] += $14
+		outside_span[key] += $15
+		pct[key] += $16
+		avg[key] += $17
+		p95[key] += $18
 		count[key]++
 	}
 	END {
@@ -245,7 +261,7 @@ awk -F'\t' '
 ' "$locality_tsv" >"$locality_summary_tsv"
 {
 	head -n 1 "$locality_summary_tsv"
-	tail -n +2 "$locality_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4 -k5,5n -k6,6V -k7,7 -k8,8 -k9,9
+	tail -n +2 "$locality_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4 -k5,5n -k6,6V -k7,7 -k8,8 -k9,9 -k10,10
 } >"$locality_summary_tsv.tmp"
 mv "$locality_summary_tsv.tmp" "$locality_summary_tsv"
 
