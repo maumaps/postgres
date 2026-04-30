@@ -709,6 +709,17 @@ Do not repeat these paths blindly:
   improve, so the more aggressive threshold only spent locality budget without
   buying a useful compact-overflow win.  The gzipped raw run is under
   `/home/kom/tmp/clustered-write-synthetic/reserve-threshold4-focused-20260430-233816/`.
+* **Lowering `CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES` from `16` to `4`:**
+  rejected.  This tried to make dense multi-hot COPY batches stop spending
+  clustered-target work sooner, using a scale `1`, repeat `3`,
+  `hot_tile_fraction=0.9`, `hot_tile_count=128` run with unordered and
+  clustered-key ordered COPY input.  It preserved the same broad locality shape
+  but made both clustered COPY medians worse versus the clean threshold-`16`
+  head: unordered regressed from `140.79 ms` to `200.88 ms`, and ordered
+  regressed from `86.61 ms` to `129.12 ms`.  The code experiment was reverted
+  and `tmp_install` was rebuilt from the clean branch.  The gzipped raw run is
+  under
+  `/home/kom/tmp/clustered-write-synthetic/prefix-threshold4-multi-hot-128-copy-20260501-034550/`.
 * **Relying on ordered diff input as the non-hot cost fix:** rejected as a
   standalone answer.  A scale `1`, repeat `3`, single-key `hot=0` run with
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` kept the same locality shape
