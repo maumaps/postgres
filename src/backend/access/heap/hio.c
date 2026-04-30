@@ -28,6 +28,7 @@
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
@@ -39,6 +40,18 @@
  */
 #define CLUSTERED_WRITE_MAX_INDEX_TIDS		1024
 #define CLUSTERED_WRITE_MAX_HEAP_BLOCKS		32
+#define CLUSTERED_WRITE_CACHE_MAGIC			0x48435743	/* HCWC */
+
+typedef struct HeapClusteredWriteCache
+{
+	uint32		magic;
+	bool		overflowActive;
+	AttrNumber	overflowAttnum;
+	Oid			overflowCollation;
+	RegProcedure overflowEqProc;
+	Datum		overflowValue;
+	BlockNumber overflowTargetBlock;
+} HeapClusteredWriteCache;
 
 static bool ClusteredWriteRememberCandidate(Relation relation,
 											BlockNumber nblocks,
@@ -66,7 +79,16 @@ static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
 													HeapTuple tuple,
 													Size len,
 													BlockNumber *targetBlocks,
-													int maxTargetBlocks);
+													int maxTargetBlocks,
+													bool *clusteredCandidatesExhausted);
+static bool ClusteredWriteGetCachedOverflowTarget(Relation relation,
+												  HeapTuple tuple,
+												  BlockNumber *targetBlock);
+static void ClusteredWriteRememberOverflowTarget(Relation relation,
+												 HeapTuple tuple,
+												 BlockNumber targetBlock);
+static void ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
+													 BlockNumber targetBlock);
 
 /*
  * RelationCanUseClusteredTargetProbe
@@ -301,7 +323,8 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 										  Size len,
 										  BlockNumber *targetBlocks,
 										  int maxTargetBlocks,
-										  bool firstCandidateOnly)
+										  bool firstCandidateOnly,
+										  bool *clusteredCandidatesExhausted)
 {
 	ScanKeyData skey[INDEX_MAX_KEYS];
 	IndexScanDesc scan;
@@ -317,6 +340,9 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	int			ntargets = 0;
 
 	Assert(maxTargetBlocks > 0);
+
+	if (clusteredCandidatesExhausted != NULL)
+		*clusteredCandidatesExhausted = false;
 
 	candidateFreeSpacePtr = firstCandidateOnly ? NULL : candidateFreeSpace;
 
@@ -530,13 +556,162 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 			targetBlocks[ntargets++] = candidates[i];
 	}
 
-	for (int i = ncandidates - 1; i >= 0 && ntargets < maxTargetBlocks; i--)
-	{
-		if (candidateFreeSpace[i] < len)
-			targetBlocks[ntargets++] = candidates[i];
-	}
+	if (ntargets == 0 && ncandidates > 0 &&
+		clusteredCandidatesExhausted != NULL)
+		*clusteredCandidatesExhausted = true;
 
 	return ntargets;
+}
+
+static HeapClusteredWriteCache *
+ClusteredWriteGetCache(Relation relation)
+{
+	HeapClusteredWriteCache *cache;
+
+	cache = (HeapClusteredWriteCache *) relation->rd_amcache;
+	if (cache != NULL)
+	{
+		if (cache->magic == CLUSTERED_WRITE_CACHE_MAGIC)
+			return cache;
+
+		/*
+		 * Heap owns rd_amcache for heap relations.  If this ever fires, avoid
+		 * interpreting another AM's private bytes as clustered-write state.
+		 */
+		return NULL;
+	}
+
+	cache = MemoryContextAllocZero(CacheMemoryContext,
+								   sizeof(HeapClusteredWriteCache));
+	cache->magic = CLUSTERED_WRITE_CACHE_MAGIC;
+	relation->rd_amcache = cache;
+	return cache;
+}
+
+static bool
+ClusteredWriteGetCachedOverflowTarget(Relation relation, HeapTuple tuple,
+									  BlockNumber *targetBlock)
+{
+	HeapClusteredWriteCache *cache;
+	Datum		prefixValue;
+	bool		prefixIsNull;
+	bool		equal;
+
+	cache = (HeapClusteredWriteCache *) relation->rd_amcache;
+	if (cache == NULL ||
+		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC ||
+		!cache->overflowActive ||
+		!BlockNumberIsValid(cache->overflowTargetBlock) ||
+		tuple == NULL)
+		return false;
+
+	prefixValue = heap_getattr(tuple, cache->overflowAttnum,
+							   relation->rd_att, &prefixIsNull);
+	if (prefixIsNull)
+		return false;
+
+	equal = DatumGetBool(OidFunctionCall2Coll(cache->overflowEqProc,
+											  cache->overflowCollation,
+											  cache->overflowValue,
+											  prefixValue));
+	if (!equal)
+		return false;
+
+	*targetBlock = cache->overflowTargetBlock;
+	return true;
+}
+
+static void
+ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
+									 BlockNumber targetBlock)
+{
+	HeapClusteredWriteCache *cache;
+	Relation	indexRelation;
+	Oid			indexOid;
+	Oid			eqOperator;
+	RegProcedure eqProc;
+	Oid			typeOid;
+	AttrNumber	attnum;
+	Datum		prefixValue;
+	bool		prefixIsNull;
+	bool		typByVal;
+
+	if (tuple == NULL || !BlockNumberIsValid(targetBlock))
+		return;
+
+	indexOid = RelationGetClusteredIndex(relation);
+	if (!OidIsValid(indexOid))
+		return;
+
+	indexRelation = try_index_open(indexOid, AccessShareLock);
+	if (indexRelation == NULL)
+		return;
+
+	if (!RelationCanUseClusteredTargetProbe(relation, indexRelation))
+	{
+		index_close(indexRelation, AccessShareLock);
+		return;
+	}
+
+	attnum = indexRelation->rd_index->indkey.values[0];
+	typeOid = indexRelation->rd_opcintype[0];
+	typByVal = get_typbyval(typeOid);
+	if (attnum <= 0 || !typByVal)
+	{
+		index_close(indexRelation, AccessShareLock);
+		return;
+	}
+
+	eqOperator = get_opfamily_member(indexRelation->rd_opfamily[0],
+									 typeOid,
+									 typeOid,
+									 BTEqualStrategyNumber);
+	if (!OidIsValid(eqOperator))
+	{
+		index_close(indexRelation, AccessShareLock);
+		return;
+	}
+	eqProc = get_opcode(eqOperator);
+	if (!RegProcedureIsValid(eqProc))
+	{
+		index_close(indexRelation, AccessShareLock);
+		return;
+	}
+
+	prefixValue = heap_getattr(tuple, attnum, relation->rd_att, &prefixIsNull);
+	if (prefixIsNull)
+	{
+		index_close(indexRelation, AccessShareLock);
+		return;
+	}
+
+	cache = ClusteredWriteGetCache(relation);
+	if (cache != NULL)
+	{
+		cache->overflowActive = true;
+		cache->overflowAttnum = attnum;
+		cache->overflowCollation = indexRelation->rd_indcollation[0];
+		cache->overflowEqProc = eqProc;
+		cache->overflowValue = prefixValue;
+		cache->overflowTargetBlock = targetBlock;
+	}
+
+	index_close(indexRelation, AccessShareLock);
+}
+
+static void
+ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
+										 BlockNumber targetBlock)
+{
+	HeapClusteredWriteCache *cache;
+
+	cache = (HeapClusteredWriteCache *) relation->rd_amcache;
+	if (cache == NULL ||
+		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC ||
+		!cache->overflowActive)
+		return;
+
+	cache->overflowTargetBlock = targetBlock;
 }
 
 /*
@@ -547,7 +722,8 @@ static int
 RelationGetClusteredTargetBlocksForTuple(Relation relation, HeapTuple tuple,
 										 Size len,
 										 BlockNumber *targetBlocks,
-										 int maxTargetBlocks)
+										 int maxTargetBlocks,
+										 bool *clusteredCandidatesExhausted)
 {
 	Oid			indexOid;
 	Relation	indexRelation;
@@ -569,7 +745,8 @@ RelationGetClusteredTargetBlocksForTuple(Relation relation, HeapTuple tuple,
 														 tuple, len,
 														 targetBlocks,
 														 maxTargetBlocks,
-														 false);
+														 false,
+														 clusteredCandidatesExhausted);
 
 	index_close(indexRelation, AccessShareLock);
 
@@ -1022,6 +1199,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 				clusteredTargetIndex = 0;
 	bool		usingClusteredTarget = false;
 	bool		usingClusteredOverflowTarget = false;
+	bool		clusteredCandidatesExhausted = false;
 	bool		usingPreferredBlock = false;
 	bool		unlockedTargetBuffer;
 	bool		recheckVmPins;
@@ -1098,15 +1276,36 @@ RelationGetBufferForTuple(Relation relation, Size len,
 		}
 		else if (tuple != NULL)
 		{
-			nclusteredTargetBlocks =
-				RelationGetClusteredTargetBlocksForTuple(relation, tuple,
-														 targetFreeSpace,
-														 clusteredTargetBlocks,
-														 lengthof(clusteredTargetBlocks));
-			if (nclusteredTargetBlocks > 0)
-				targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+			if (ClusteredWriteGetCachedOverflowTarget(relation, tuple,
+													  &targetBlock))
+				usingClusteredOverflowTarget = true;
+			else
+			{
+				nclusteredTargetBlocks =
+					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
+															 targetFreeSpace,
+															 clusteredTargetBlocks,
+															 lengthof(clusteredTargetBlocks),
+															 &clusteredCandidatesExhausted);
+				if (nclusteredTargetBlocks > 0)
+					targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+				else if (clusteredCandidatesExhausted)
+				{
+					BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
+
+					if (nblocks > 0)
+					{
+						targetBlock = nblocks - 1;
+						usingClusteredOverflowTarget = true;
+						ClusteredWriteRememberOverflowTarget(relation, tuple,
+															 targetBlock);
+					}
+				}
+			}
 		}
 		usingClusteredTarget = (targetBlock != InvalidBlockNumber);
+		if (usingClusteredOverflowTarget)
+			usingClusteredTarget = false;
 	}
 
 	if (targetBlock != InvalidBlockNumber)
@@ -1287,7 +1486,8 @@ loop:
 					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
 															 targetFreeSpace,
 															 clusteredTargetBlocks,
-															 lengthof(clusteredTargetBlocks));
+															 lengthof(clusteredTargetBlocks),
+															 &clusteredCandidatesExhausted);
 				for (clusteredTargetIndex = 0;
 					 clusteredTargetIndex < nclusteredTargetBlocks;
 					 clusteredTargetIndex++)
@@ -1298,6 +1498,21 @@ loop:
 				}
 				if (clusteredTargetIndex < nclusteredTargetBlocks)
 					continue;
+				if (clusteredCandidatesExhausted)
+				{
+					BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
+
+					usingClusteredTarget = false;
+					if (nblocks > 0)
+					{
+						targetBlock = nblocks - 1;
+						usingClusteredOverflowTarget = true;
+						ClusteredWriteRememberOverflowTarget(relation, tuple,
+															 targetBlock);
+						continue;
+					}
+					targetBlock = InvalidBlockNumber;
+				}
 			}
 
 			usingClusteredTarget = false;
@@ -1339,7 +1554,6 @@ loop:
 			if (use_fsm)
 				RecordPageWithFreeSpace(relation, targetBlock,
 										pageFreeSpace);
-			usingClusteredOverflowTarget = false;
 			break;
 		}
 
@@ -1506,6 +1720,8 @@ loop:
 	 * good bet most of the time.  So for now, don't add it to FSM yet.
 	 */
 	RelationSetTargetBlock(relation, targetBlock);
+	if (usingClusteredOverflowTarget)
+		ClusteredWriteUpdateCachedOverflowTarget(relation, targetBlock);
 
 	return buffer;
 }

@@ -3024,7 +3024,8 @@ skip_clustered_prefix_cache:
 																		  heaptuples[i]->t_len,
 																		  &targetBlock,
 																		  1,
-																		  true) > 0)
+																		  true,
+																		  NULL) > 0)
 								clustered[i].targetBlock = targetBlock;
 
 							if (prefixTargetCache != NULL && !prefixIsNull)

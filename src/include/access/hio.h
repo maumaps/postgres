@@ -61,7 +61,8 @@ extern int RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 													 Size len,
 													 BlockNumber *targetBlocks,
 													 int maxTargetBlocks,
-													 bool firstCandidateOnly);
+													 bool firstCandidateOnly,
+													 bool *clusteredCandidatesExhausted);
 extern Buffer RelationGetBufferForTuple(Relation relation, Size len,
 										HeapTuple tuple,
 										BlockNumber preferredBlock,
