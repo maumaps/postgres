@@ -8,6 +8,17 @@ Run the script against a build with clustered writes:
 
     psql -v scale=1 -v use_brin=false -f src/tools/clustered_write_bench/osm2pgsql_diff.sql postgres
 
+For repeated runs, use the wrapper:
+
+    REPEATS=3 SCALE_VALUES="0.1 1" BRIN_VALUES="false true" \
+        src/tools/clustered_write_bench/run_synthetic_bench.sh
+
+The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
+the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
+`locality.tsv`, `timing_summary.tsv`, and `locality_summary.tsv`.  This is the
+preferred way to compare small hot-path changes because single runs can be
+noisy even with `fsync=off`.
+
 Larger scale values increase table and diff sizes.  The workload:
 
 * loads a synthetic table keyed by an OSM-like object id and a tile-like
