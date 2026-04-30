@@ -909,7 +909,13 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	 */
 	targetBlock = InvalidBlockNumber;
 
-	if (use_fsm)
+	/*
+	 * Clustered target selection is an insertion policy.  heap_update passes
+	 * otherBuffer for the old tuple page and has its own placement constraints
+	 * around HOT/fillfactor and buffer locking; keep moved update tuples on the
+	 * regular FSM path.
+	 */
+	if (use_fsm && otherBuffer == InvalidBuffer)
 	{
 		nclusteredTargetBlocks =
 			RelationGetClusteredTargetBlocksForTuple(relation, tuple, len,
