@@ -82,6 +82,15 @@ select current_database() as clustered_write_database \gset
 \connect :clustered_write_database
 \timing on
 
+create function pg_temp.tid_block(tid)
+returns bigint
+language sql
+immutable
+parallel safe
+as $$
+    select split_part(trim(both '()' from $1::text), ',', 1)::bigint;
+$$;
+
 create temp table clustered_write_settings as
 select (200000 * :scale)::int as base_rows,
        (20000 * :scale)::int as insert_rows,
@@ -99,8 +108,8 @@ create temp table clustered_write_step_timings
 create temp table clustered_write_base_ranges as
 select 'clustered_write'::text as variant,
        tile_id,
-       min(tid_block(ctid)) as min_block,
-       max(tid_block(ctid)) as max_block
+       min(pg_temp.tid_block(ctid)) as min_block,
+       max(pg_temp.tid_block(ctid)) as max_block
 from clustered_write_osm_diff_on
 group by tile_id
 
@@ -108,8 +117,8 @@ union all
 
 select 'without_cluster_metadata'::text as variant,
        tile_id,
-       min(tid_block(ctid)) as min_block,
-       max(tid_block(ctid)) as max_block
+       min(pg_temp.tid_block(ctid)) as min_block,
+       max(pg_temp.tid_block(ctid)) as max_block
 from clustered_write_osm_diff_off
 group by tile_id;
 
@@ -192,7 +201,7 @@ with measured as
 (
     select 'clustered_write'::text as variant,
            'insert'::text as diff_kind,
-           tid_block(o.ctid) as heap_block,
+           pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_on as o
@@ -206,7 +215,7 @@ with measured as
 
     select 'clustered_write'::text as variant,
            'update'::text as diff_kind,
-           tid_block(o.ctid) as heap_block,
+           pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_on as o
@@ -221,7 +230,7 @@ with measured as
 
     select 'without_cluster_metadata'::text as variant,
            'insert'::text as diff_kind,
-           tid_block(o.ctid) as heap_block,
+           pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_off as o
@@ -235,7 +244,7 @@ with measured as
 
     select 'without_cluster_metadata'::text as variant,
            'update'::text as diff_kind,
-           tid_block(o.ctid) as heap_block,
+           pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_off as o

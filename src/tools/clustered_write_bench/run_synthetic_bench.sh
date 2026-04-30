@@ -5,12 +5,46 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 DBNAME=${DBNAME:-postgres}
 PSQL=${PSQL:-psql}
+PG_BINDIR=${PG_BINDIR:-}
+USE_TEMP_INSTANCE=${USE_TEMP_INSTANCE:-false}
+PGPORT=${PGPORT:-6543}
+PG_OPTS=${PG_OPTS:-}
 REPEATS=${REPEATS:-3}
 SCALE_VALUES=${SCALE_VALUES:-"0.1 1"}
 BRIN_VALUES=${BRIN_VALUES:-"false true"}
 OUTDIR=${OUTDIR:-"$HOME/tmp/clustered-write-synthetic/$(date +%Y%m%d-%H%M%S)"}
 
 mkdir -p "$OUTDIR/raw"
+
+if [[ "$USE_TEMP_INSTANCE" == "true" ]]; then
+	if [[ -z "$PG_BINDIR" ]]; then
+		printf 'USE_TEMP_INSTANCE=true requires PG_BINDIR=/path/to/postgres/bin\n' >&2
+		exit 1
+	fi
+
+	PGDATA="$OUTDIR/pgdata"
+	PGHOST="$OUTDIR/socket"
+	export PGHOST PGPORT
+	mkdir -p "$PGHOST"
+	PSQL="$PG_BINDIR/psql"
+
+	"$PG_BINDIR/initdb" -D "$PGDATA" --auth trust --no-sync --no-instructions \
+		>"$OUTDIR/initdb.log"
+	"$PG_BINDIR/pg_ctl" -D "$PGDATA" -l "$OUTDIR/postgres.log" \
+		-o "-k $PGHOST -p $PGPORT -c listen_addresses='' -c fsync=off -c synchronous_commit=off -c full_page_writes=off $PG_OPTS" \
+		start >"$OUTDIR/pg_ctl_start.log"
+
+	stop_temp_instance()
+	{
+		"$PG_BINDIR/pg_ctl" -D "$PGDATA" stop -m fast \
+			>"$OUTDIR/pg_ctl_stop.log" 2>&1 || true
+	}
+	trap stop_temp_instance EXIT
+fi
+
+"$PSQL" -X -v ON_ERROR_STOP=1 -d "$DBNAME" \
+	-c 'select version() as benchmark_postgres_version' \
+	>"$OUTDIR/server_version.txt"
 
 timings_tsv="$OUTDIR/timings.tsv"
 locality_tsv="$OUTDIR/locality.tsv"

@@ -13,11 +13,19 @@ For repeated runs, use the wrapper:
     REPEATS=3 SCALE_VALUES="0.1 1" BRIN_VALUES="false true" \
         src/tools/clustered_write_bench/run_synthetic_bench.sh
 
+To avoid accidentally benchmarking the system PostgreSQL instead of the build
+under test, the wrapper can create and stop a temporary instance itself:
+
+    USE_TEMP_INSTANCE=true PG_BINDIR=/path/to/patched/postgres/bin \
+        REPEATS=3 SCALE_VALUES=1 BRIN_VALUES=false \
+        src/tools/clustered_write_bench/run_synthetic_bench.sh
+
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 `locality.tsv`, `timing_summary.tsv`, and `locality_summary.tsv`.  This is the
 preferred way to compare small hot-path changes because single runs can be
-noisy even with `fsync=off`.
+noisy even with `fsync=off`.  It also writes `server_version.txt`; check that
+file before comparing runs that were not started with `USE_TEMP_INSTANCE=true`.
 
 Larger scale values increase table and diff sizes.  The workload:
 

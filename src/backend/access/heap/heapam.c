@@ -31,6 +31,7 @@
  */
 #include "postgres.h"
 
+#include "common/hashfn.h"
 #include "access/genam.h"
 #include "access/gist.h"
 #include "access/gist_private.h"
@@ -91,7 +92,17 @@ typedef struct HeapTupleClusteredTargetCacheEntry
 {
 	Datum		prefixValue;
 	BlockNumber targetBlock;
+	bool		occupied;
 } HeapTupleClusteredTargetCacheEntry;
+
+/*
+ * COPY currently feeds heap_multi_insert() in batches of up to 1000 tuples. A
+ * small direct-mapped hash table gives by-value leading keys, such as OSM tile
+ * ids, cheap repeated target lookups.  Collisions only cause cache misses or
+ * evictions: every hit is still verified by the clustered index opfamily's
+ * equality function before reusing the target block.
+ */
+#define CLUSTERED_WRITE_PREFIX_TARGET_HASH_FACTOR	4
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
@@ -2559,7 +2570,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		RegProcedure prefixCacheEqProc = InvalidOid;
 		HeapTupleClusteredTargetCacheEntry *prefixTargetCache = NULL;
 		MemoryContext prefixCacheCompareCxt = NULL;
-		int			nprefixTargetCache = 0;
+		bool		usePrefixHashCache = false;
+		int			prefixTargetCacheLimit = 0;
+		int			prefixTargetCacheSize = 0;
+		int			prefixTargetCacheMask = 0;
 
 		if (!IsBootstrapProcessingMode())
 		{
@@ -2605,9 +2619,19 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					prefixCacheAttnum = InvalidAttrNumber;
 				else
 				{
+					prefixTargetCacheLimit =
+						pg_nextpower2_32(Max(16,
+											 ntuples *
+											 CLUSTERED_WRITE_PREFIX_TARGET_HASH_FACTOR));
+					usePrefixHashCache =
+						get_typbyval(clusteredIndexRelation->rd_opcintype[0]);
+
+					if (!usePrefixHashCache)
+						prefixTargetCacheLimit = ntuples;
 					prefixTargetCache =
-						palloc_array(HeapTupleClusteredTargetCacheEntry,
-									 ntuples);
+						palloc0_array(HeapTupleClusteredTargetCacheEntry,
+									  prefixTargetCacheLimit);
+					prefixTargetCacheMask = prefixTargetCacheLimit - 1;
 					prefixCacheCompareCxt =
 						AllocSetContextCreate(CurrentMemoryContext,
 											  "clustered target cache compare",
@@ -2627,6 +2651,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					Datum		prefixValue = (Datum) 0;
 					bool		prefixIsNull = true;
 					bool		foundCachedTarget = false;
+					int			prefixCacheSlot = -1;
 
 					if (prefixTargetCache != NULL)
 					{
@@ -2637,17 +2662,38 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 										 &prefixIsNull);
 						if (!prefixIsNull)
 						{
-							for (int j = 0; j < nprefixTargetCache; j++)
+							int			ncacheEntries;
+
+							if (usePrefixHashCache)
+							{
+								uint32		prefixHash;
+
+								prefixHash = hash_bytes((unsigned char *) &prefixValue,
+														sizeof(Datum));
+								prefixCacheSlot =
+									prefixHash & prefixTargetCacheMask;
+								ncacheEntries =
+									prefixTargetCache[prefixCacheSlot].occupied ?
+									1 : 0;
+							}
+							else
+								ncacheEntries = prefixTargetCacheSize;
+
+							for (int j = 0; j < ncacheEntries; j++)
 							{
 								bool		equal;
 								MemoryContext oldcontext;
+								int			cacheSlot;
+
+								cacheSlot = usePrefixHashCache ?
+									prefixCacheSlot : j;
 
 								oldcontext =
 									MemoryContextSwitchTo(prefixCacheCompareCxt);
 								equal =
 									DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
 																	  prefixCacheCollation,
-																	  prefixTargetCache[j].prefixValue,
+																	  prefixTargetCache[cacheSlot].prefixValue,
 																	  prefixValue));
 								MemoryContextSwitchTo(oldcontext);
 								MemoryContextReset(prefixCacheCompareCxt);
@@ -2655,7 +2701,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 								if (equal)
 								{
 									clustered[i].targetBlock =
-										prefixTargetCache[j].targetBlock;
+										prefixTargetCache[cacheSlot].targetBlock;
 									foundCachedTarget = true;
 									break;
 								}
@@ -2675,11 +2721,22 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 						if (prefixTargetCache != NULL && !prefixIsNull)
 						{
-							prefixTargetCache[nprefixTargetCache].prefixValue =
+							int			cacheSlot;
+
+							if (usePrefixHashCache)
+								cacheSlot = prefixCacheSlot;
+							else
+							{
+								Assert(prefixTargetCacheSize <
+									   prefixTargetCacheLimit);
+								cacheSlot = prefixTargetCacheSize++;
+							}
+
+							prefixTargetCache[cacheSlot].prefixValue =
 								prefixValue;
-							prefixTargetCache[nprefixTargetCache].targetBlock =
+							prefixTargetCache[cacheSlot].targetBlock =
 								clustered[i].targetBlock;
-							nprefixTargetCache++;
+							prefixTargetCache[cacheSlot].occupied = true;
 						}
 					}
 				}
