@@ -134,6 +134,27 @@ cost and locality problem; it is not just a faster version of the row-at-a-time
 path.  The raw gzip output is under
 `/home/kom/tmp/clustered-write-synthetic/copy-vs-insert-single-key-20260501-020036/`.
 
+That COPY locality loss was fixed by stopping the multi-insert page packer at
+clustered target boundaries.  The pre-fix batch sort grouped tuples by their
+precomputed clustered target block, but once the first tuple selected a page,
+the normal packer could still fill that page with later tuples that were aiming
+at a different clustered neighborhood.  A scale `0.02` smoke moved COPY
+fillfactor `90` locality back to `84-85%` inside the base range.  A focused
+scale `1`, repeat `3`, integer-key run restored fillfactor `90` COPY locality
+to `83.97%` unordered and `84.75%` ordered, matching the `INSERT ... SELECT`
+shape; fillfactor `50` stayed `100%`.  The write-time tradeoff is visible:
+unordered integer COPY remained faster than INSERT (`ff90` median `311.79 ms`
+versus `522.57 ms`, `ff50` `387.20 ms` versus `908.74 ms` in that run), while
+ordered `ff90` COPY regressed (`483.56 ms` versus `296.00 ms`).  A repeat `2`
+text-key COPY check kept the same locality shape (`83.97-84.75%` at
+fillfactor `90`, `100%` at `50`) but remained CPU-heavy (`ff90` medians
+`853.26 ms` unordered, `507.18 ms` ordered).  Treat the boundary guard as a
+locality correctness fix for COPY; it does not by itself solve text-key probe
+cost or every ordered-input timing case.  Raw gzip output is under
+`/home/kom/tmp/clustered-write-synthetic/copy-boundary-integer-focused-20260501-021034/`
+and
+`/home/kom/tmp/clustered-write-synthetic/copy-boundary-text-focused-20260501-021405/`.
+
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 `locality.tsv`, `timing_summary.tsv`, and `locality_summary.tsv`.  This is the

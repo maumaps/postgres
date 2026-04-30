@@ -171,6 +171,44 @@ RESET enable_bitmapscan;
 RESET enable_seqscan;
 DROP TABLE clstr_write_copy_tid;
 
+-- Verify clustered COPY packing stops at clustered target boundaries.
+CREATE TABLE clstr_write_copy_boundaries (id int, k int, filler text) WITH (fillfactor = 90);
+INSERT INTO clstr_write_copy_boundaries
+SELECT g, ((g - 1) % 32) + 1, repeat('x', 64)
+FROM generate_series(1, 1600) AS g;
+CREATE INDEX clstr_write_copy_boundaries_k_id ON clstr_write_copy_boundaries (k, id);
+CLUSTER clstr_write_copy_boundaries USING clstr_write_copy_boundaries_k_id;
+CREATE TEMP TABLE clstr_write_copy_boundaries_base AS
+SELECT k, min(tid_block(ctid)) AS min_block, max(tid_block(ctid)) AS max_block
+FROM clstr_write_copy_boundaries
+GROUP BY k;
+COPY clstr_write_copy_boundaries (id, k, filler) FROM stdin;
+100001	1	y
+100002	2	y
+100003	3	y
+100004	4	y
+100005	5	y
+100006	6	y
+100007	7	y
+100008	8	y
+100009	9	y
+100010	10	y
+100011	11	y
+100012	12	y
+100013	13	y
+100014	14	y
+100015	15	y
+100016	16	y
+\.
+SELECT count(*) FILTER (WHERE tid_block(c.ctid) BETWEEN b.min_block AND b.max_block) AS inside,
+       count(*) AS total,
+       bool_and(tid_block(c.ctid) BETWEEN b.min_block AND b.max_block) AS all_inside
+FROM clstr_write_copy_boundaries AS c
+JOIN clstr_write_copy_boundaries_base AS b USING (k)
+WHERE c.id >= 100001;
+DROP TABLE clstr_write_copy_boundaries;
+DROP TABLE clstr_write_copy_boundaries_base;
+
 -- Verify all-equal clustered COPY batches also work with generated text keys.
 CREATE TABLE clstr_write_text_key (
 	id int PRIMARY KEY,

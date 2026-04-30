@@ -3222,6 +3222,30 @@ skip_clustered_prefix_cache:
 		{
 			HeapTuple	heaptup = heaptuples[ndone + nthispage];
 
+			/*
+			 * Clustered batch sorting groups tuples by a precomputed target
+			 * block, but the normal multi-insert page packer would otherwise
+			 * keep filling the first selected page with later tuples that were
+			 * aiming at a different clustered neighborhood.  Keep that
+			 * high-throughput packing behavior for ordinary tuples, while
+			 * preserving clustered placement boundaries when the batch has
+			 * remembered targets.
+			 */
+			if (heaptuple_clustered_target_blocks != NULL)
+			{
+				BlockNumber currentBlock = BufferGetBlockNumber(buffer);
+				BlockNumber nextTargetBlock =
+					heaptuple_clustered_target_blocks[ndone + nthispage];
+
+				if (BlockNumberIsValid(clustered_target_block))
+				{
+					if (nextTargetBlock != currentBlock)
+						break;
+				}
+				else if (BlockNumberIsValid(nextTargetBlock))
+					break;
+			}
+
 			if (PageGetHeapFreeSpace(page) < MAXALIGN(heaptup->t_len) + saveFreeSpace)
 				break;
 
