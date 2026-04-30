@@ -42,6 +42,7 @@
 #define CLUSTERED_WRITE_MAX_INDEX_TIDS		1024
 #define CLUSTERED_WRITE_MAX_HEAP_BLOCKS		32
 #define CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES 32
+#define CLUSTERED_WRITE_OVERFLOW_VALUE_BYTES 1024
 #define CLUSTERED_WRITE_CACHE_MAGIC			0x48435743	/* HCWC */
 
 typedef struct HeapClusteredWriteOverflowEntry
@@ -51,9 +52,11 @@ typedef struct HeapClusteredWriteOverflowEntry
 	Oid			overflowCollation;
 	RegProcedure overflowEqProc;
 	Datum		overflowValue;
+	Size		overflowValueLen;
 	int16		overflowTypLen;
 	bool		overflowTypByVal;
 	BlockNumber overflowTargetBlock;
+	char		overflowValueStorage[CLUSTERED_WRITE_OVERFLOW_VALUE_BYTES];
 } HeapClusteredWriteOverflowEntry;
 
 typedef struct HeapClusteredWriteCache
@@ -99,7 +102,7 @@ static void ClusteredWriteRememberOverflowTarget(Relation relation,
 												 BlockNumber targetBlock);
 static void ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
 													 BlockNumber targetBlock);
-static void ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
+static bool ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
 											 Datum value,
 											 bool typByVal,
 											 int16 typLen);
@@ -614,27 +617,33 @@ ClusteredWriteGetCache(Relation relation)
 	return cache;
 }
 
-static void
+static bool
 ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
 								 Datum value, bool typByVal, int16 typLen)
 {
-	MemoryContext oldcontext;
-
-	if (entry->active && !entry->overflowTypByVal)
-		pfree(DatumGetPointer(entry->overflowValue));
-
 	entry->overflowTypByVal = typByVal;
 	entry->overflowTypLen = typLen;
 
 	if (typByVal)
 	{
 		entry->overflowValue = value;
-		return;
+		entry->overflowValueLen = sizeof(Datum);
+		return true;
 	}
 
-	oldcontext = MemoryContextSwitchTo(CacheMemoryContext);
-	entry->overflowValue = datumCopy(value, typByVal, typLen);
-	MemoryContextSwitchTo(oldcontext);
+	/*
+	 * rd_amcache must be one palloc chunk.  Keep small pass-by-reference
+	 * prefixes inline and decline large values instead of allocating
+	 * subsidiary chunks that relcache invalidation would not know to free.
+	 */
+	entry->overflowValueLen = datumGetSize(value, typByVal, typLen);
+	if (entry->overflowValueLen > CLUSTERED_WRITE_OVERFLOW_VALUE_BYTES)
+		return false;
+
+	memcpy(entry->overflowValueStorage, DatumGetPointer(value),
+		   entry->overflowValueLen);
+	entry->overflowValue = PointerGetDatum(entry->overflowValueStorage);
+	return true;
 }
 
 static bool
@@ -793,7 +802,13 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 		entry->overflowAttnum = attnum;
 		entry->overflowCollation = indexRelation->rd_indcollation[0];
 		entry->overflowEqProc = eqProc;
-		ClusteredWriteStoreOverflowValue(entry, prefixValue, typByVal, typLen);
+		if (!ClusteredWriteStoreOverflowValue(entry, prefixValue,
+											 typByVal, typLen))
+		{
+			entry->active = false;
+			index_close(indexRelation, AccessShareLock);
+			return;
+		}
 		entry->overflowTargetBlock = targetBlock;
 		entry->active = true;
 	}

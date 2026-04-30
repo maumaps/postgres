@@ -381,14 +381,18 @@ Do not repeat these paths blindly:
   fillfactor `90` / `50` to `70.85 ms` / `82.54 ms`, while preserving the
   compact `insert_hot` spans (`384` / `693` blocks).
 * **By-reference clustered prefixes in the overflow cache:** fixed after the
-  by-value cache left generated text keys on the slow path.  Before copying
-  varlena prefixes into `CacheMemoryContext`, scale `1` text hot inserts still
-  took roughly `770-805 ms`.  With bounded cached text prefixes, the same
-  text-key matrix falls to `60.69-121.84 ms` depending on fillfactor,
-  single-key mode, and hot fraction.  A same-backend smoke test that overwrote
-  `128` text prefixes through a `32`-entry cache held `CacheMemoryContext`
-  steady at `1048576` total bytes / `788232` used bytes before and after
-  `16384` additional inserts.
+  by-value cache left generated text keys on the slow path.  The first
+  implementation copied varlena prefixes into separate `CacheMemoryContext`
+  chunks, which was fast but violated the `rd_amcache` single-chunk lifetime
+  rule.  The kept implementation stores small by-reference prefixes inline in
+  the `32`-entry cache and skips caching oversized values.  Before this path,
+  scale `1` text hot inserts still took roughly `770-805 ms`; with bounded
+  cached text prefixes, the text-key matrix falls to `63.07-112.31 ms` in the
+  latest inline-cache sweep, depending on fillfactor, single-key mode, and hot
+  fraction.  A same-backend overwrite smoke held `CacheMemoryContext` steady,
+  and a relcache-invalidation stress (`30` insert/invalidation cycles) dropped
+  from `1082680` total / `787256` used bytes after warmup to `1048576` total /
+  `755272` used bytes after stress instead of growing.
 
 The useful lesson from the rejected hot-prefix work is that duplicate-key
 batches need either a genuinely local page-selection policy for the repeated
