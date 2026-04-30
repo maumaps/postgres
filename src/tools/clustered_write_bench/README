@@ -33,6 +33,13 @@ When this value is greater than zero, locality output splits inserts into
 `insert_hot` for the forced duplicate-key rows and `insert_rest` for the
 remaining rows.  This keeps a hot-key cliff from being hidden by a small
 well-placed non-hot tail.
+The current by-value all-equal batch guard deliberately treats a fully hot
+integer/OID prefix batch as "stop spending clustered-write work": at scale `1`,
+single-key clustered insert improved from the previous clean-head `1330.10 ms`
+to `866.17 ms` at hot `0.9`, and from `1702.04 ms` to `725.13 ms` at hot `1.0`
+in the verified temp-instance run.  The hot rows still do not become local;
+the win is avoiding wasted clustered-index work until a real duplicate-key page
+selection policy exists.
 
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
@@ -175,13 +182,16 @@ Do not repeat these paths blindly:
 * **Early leading-prefix whole-batch skip:** rejected because the quick
   shortcut looked attractive for duplicate keys but made hot `1.0` scale `0.1`
   slower in practice.
-* **Early all-equal hot-prefix shortcut before cache allocation:** rejected
-  after the disk-pressure recovery run.  It increased hot `0.9`/`1.0` scale
-  `0.1` insert timings in smoke runs without changing locality.
-* **Datum equality fast-path for integer/OID prefixes:** rejected for now.  Even
-  though integer `Datum` equality is semantically safe for the tested built-in
-  types, the extra branch did not help the workload; hot `0.9` and `1.0` smoke
-  timings got worse while locality stayed unchanged.
+* **Generic early all-equal hot-prefix shortcut:** rejected after the
+  disk-pressure recovery run.  The broad version increased hot `0.9`/`1.0`
+  scale `0.1` insert timings in smoke runs without changing locality.  The
+  kept variant is narrower: it only handles all-equal by-value integer/OID
+  prefixes and was accepted only after the scale `1` temp-instance run above.
+* **Per-tuple Datum equality fast-path for integer/OID prefixes:** rejected for
+  now.  Even though integer `Datum` equality is semantically safe for the
+  tested built-in types, adding the branch to ordinary prefix-cache hits did
+  not help the workload; hot `0.9` and `1.0` smoke timings got worse while
+  locality stayed unchanged.
 * **Btree batch sorting before target probes:** rejected on the real Georgia
   osm2pgsql run (`3:14.39` create, `4:08.59` append).  For this workload,
   btree target-page probing beats sorting the batch first.

@@ -48,6 +48,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
 #include "executor/instrument_node.h"
 #include "pgstat.h"
@@ -124,6 +125,7 @@ typedef struct HeapTupleClusteredPrefixCountEntry
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
 static int	heap_clustered_write_item_cmp(const void *a, const void *b, void *arg);
+static bool heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid);
 static bool heap_clustered_write_index_can_sort(Relation relation,
 												Relation indexRelation);
 static int	heap_prepare_clustered_write_sort(Relation relation,
@@ -233,6 +235,21 @@ heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
 	if (left->inputIndex > right->inputIndex)
 		return 1;
 	return 0;
+}
+
+static bool
+heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid)
+{
+	switch (typeOid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case OIDOID:
+			return true;
+		default:
+			return false;
+	}
 }
 
 static bool
@@ -2642,6 +2659,64 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					prefixCacheAttnum = InvalidAttrNumber;
 				else
 				{
+					/*
+					 * Very hot by-value prefixes do not need the full prefix
+					 * cache machinery.  If the whole COPY batch has the same
+					 * simple key, skip clustered placement before allocating
+					 * the cache and take the regular bulk/FSM path instead.
+					 */
+					if (heap_clustered_write_prefix_can_compare_by_datum(
+							clusteredIndexRelation->rd_opcintype[0]))
+					{
+						Datum		firstPrefixValue;
+						Datum		lastPrefixValue;
+						bool		firstPrefixIsNull;
+						bool		lastPrefixIsNull;
+						bool		allSamePrefix = false;
+
+						firstPrefixValue =
+							heap_getattr(heaptuples[0],
+										 prefixCacheAttnum,
+										 relation->rd_att,
+										 &firstPrefixIsNull);
+						lastPrefixValue =
+							heap_getattr(heaptuples[ntuples - 1],
+										 prefixCacheAttnum,
+										 relation->rd_att,
+										 &lastPrefixIsNull);
+
+						if (!firstPrefixIsNull && !lastPrefixIsNull &&
+							firstPrefixValue == lastPrefixValue)
+						{
+							allSamePrefix = true;
+							for (i = 1; i < ntuples - 1; i++)
+							{
+								Datum		prefixValue;
+								bool		prefixIsNull;
+
+								prefixValue =
+									heap_getattr(heaptuples[i],
+												 prefixCacheAttnum,
+												 relation->rd_att,
+												 &prefixIsNull);
+								if (prefixIsNull ||
+									prefixValue != firstPrefixValue)
+								{
+									allSamePrefix = false;
+									break;
+								}
+							}
+						}
+
+						if (allSamePrefix &&
+							ntuples >
+							CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES)
+							hotPrefixTupleCount = ntuples;
+					}
+
+					if (hotPrefixTupleCount == ntuples)
+						goto skip_clustered_prefix_cache;
+
 					prefixTargetCacheLimit =
 						pg_nextpower2_32(Max(16,
 											 ntuples *
@@ -2767,8 +2842,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				}
 			}
 
+skip_clustered_prefix_cache:
+
 			if (use_clustered_target_probe &&
-				prefixCountCache != NULL &&
 				hotPrefixTupleCount == ntuples)
 			{
 				heaptuple_skip_clustered_target_lookup = true;
