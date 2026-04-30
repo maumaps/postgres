@@ -587,6 +587,17 @@ Do not repeat these paths blindly:
   `/home/kom/tmp/clustered-write-synthetic/direct-prefix-target-cache-text-copy-20260501-025740/`
   and
   `/home/kom/tmp/clustered-write-synthetic/direct-prefix-target-cache-text-ff50-unordered-rerun-20260501-025849/`.
+* **Lazy prefix-count allocation based on input-order runs:** rejected.  The
+  idea was to avoid the full prefix-count pass for ordinary non-hot COPY
+  batches, allocating it only when adjacent input tuples already showed a
+  same-prefix run longer than `CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES`.  The
+  prototype first needed extra compile fixes around the moved comparator and an
+  uninitialized comparator warning, then crashed with SIGSEGV on the first
+  scale `1` non-hot integer fillfactor `90` unordered COPY case.  Since the
+  run detector added control-flow risk before proving any timing win, the code
+  experiment was reverted and `tmp_install` was rebuilt from the clean branch.
+  The crash log and compressed raw output are under
+  `/home/kom/tmp/clustered-write-synthetic/lazy-prefix-count-nonhot-copy-20260501-030413/`.
 * **Raising COPY's buffered byte limit to reach the tuple limit:** rejected.
   The idea was to let clustered COPY batches get closer to the existing
   `1000`-tuple cap instead of flushing around `65535` bytes, giving the
