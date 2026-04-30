@@ -40,6 +40,13 @@ the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 preferred way to compare small hot-path changes because single runs can be
 noisy even with `fsync=off`.  It also writes `server_version.txt`; check that
 file before comparing runs that were not started with `USE_TEMP_INSTANCE=true`.
+Raw `psql` outputs are compressed with gzip by default; set
+`COMPRESS_RAW=false` to leave them as plain `.out` files.
+
+When `USE_TEMP_INSTANCE=true`, the temporary data directory and socket
+directory are removed after the run by default, leaving the logs and summaries
+behind.  Set `KEEP_TEMP_INSTANCE_DATA=true` only when you need to inspect the
+finished cluster.
 
 Larger scale values increase table and diff sizes.  The workload:
 

@@ -15,6 +15,8 @@ BRIN_VALUES=${BRIN_VALUES:-"false true"}
 SINGLE_KEY_VALUES=${SINGLE_KEY_VALUES:-"false"}
 HOT_TILE_FRACTION_VALUES=${HOT_TILE_FRACTION_VALUES:-"0"}
 OUTDIR=${OUTDIR:-"$HOME/tmp/clustered-write-synthetic/$(date +%Y%m%d-%H%M%S)"}
+COMPRESS_RAW=${COMPRESS_RAW:-true}
+KEEP_TEMP_INSTANCE_DATA=${KEEP_TEMP_INSTANCE_DATA:-false}
 
 mkdir -p "$OUTDIR/raw"
 
@@ -40,6 +42,9 @@ if [[ "$USE_TEMP_INSTANCE" == "true" ]]; then
 	{
 		"$PG_BINDIR/pg_ctl" -D "$PGDATA" stop -m fast \
 			>"$OUTDIR/pg_ctl_stop.log" 2>&1 || true
+		if [[ "$KEEP_TEMP_INSTANCE_DATA" != "true" ]]; then
+			rm -rf "$PGDATA" "$PGHOST"
+		fi
 	}
 	trap stop_temp_instance EXIT
 fi
@@ -100,6 +105,10 @@ SQL
 							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 								run, scale, brin, single_key, hot_tile_fraction, $2, $3, $4, $5, $6, $7, $8, $9
 						}' "$raw" >>"$locality_tsv"
+
+					if [[ "$COMPRESS_RAW" == "true" ]]; then
+						gzip -f "$raw"
+					fi
 				done
 			done
 		done
@@ -167,3 +176,9 @@ printf 'timings: %s\n' "$timings_tsv"
 printf 'locality: %s\n' "$locality_tsv"
 printf 'timing summary: %s\n' "$timing_summary_tsv"
 printf 'locality summary: %s\n' "$locality_summary_tsv"
+if [[ "$COMPRESS_RAW" == "true" ]]; then
+	printf 'raw files compressed: true\n'
+fi
+if [[ "$USE_TEMP_INSTANCE" == "true" && "$KEEP_TEMP_INSTANCE_DATA" != "true" ]]; then
+	printf 'temporary instance data removed: true\n'
+fi
