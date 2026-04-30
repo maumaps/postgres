@@ -413,6 +413,22 @@ Do not repeat these paths blindly:
   composite text fillfactor `90`, and from `317.57 ms` to `398.11 ms` for
   single text fillfactor `90`.  The raw focused run is under
   `/home/kom/tmp/clustered-write-synthetic/single-row-target-cache-focused-20260430-230337/`.
+* **Cached overflow leading-key metadata in `rd_amcache`:** rejected as a
+  follow-up optimization to the overflow cache.  The prototype kept the leading
+  clustered-index attribute, collation, equality procedure, and type storage
+  metadata beside the overflow entries so reserve-hit accounting would not open
+  the clustered index and look up opfamily equality on every remembered target.
+  It preserved locality, but the focused scale `1`, hot `0`, repeat `3`
+  ordered/non-ordered matrix was mixed and often slower while control timings
+  were also noisy.  Representative clustered insert averages regressed from
+  `418.44 ms` to `614.21 ms` for composite integer fillfactor `50` unordered,
+  from `353.75 ms` to `548.84 ms` for composite text fillfactor `50` ordered,
+  and from `275.28 ms` to `559.61 ms` for single text fillfactor `90`
+  unordered.  Cases that improved were not enough to justify extra relcache
+  state.  The likely lesson is that this does not remove the dominant per-row
+  target probe cost, so any saved syscache/index-open work is buried in noise
+  or outweighed by the extra cache state.  The gzipped raw run is under
+  `/home/kom/tmp/clustered-write-synthetic/overflow-metadata-order-nonhot-20260430-233011/`.
 * **Immediate tail overflow after the first below-fillfactor hit:** fixed after
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES=true` exposed the failure mode.  Sorted
   non-hot input groups the few rows for each key together; with immediate
