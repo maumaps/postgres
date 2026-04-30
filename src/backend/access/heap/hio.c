@@ -511,11 +511,11 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	}
 
 	/*
-	 * Prefer pages whose FSM entry already says they can fit this tuple.  If
-	 * the FSM has no clear winner, try the rest in reverse scan order; that
-	 * keeps us away from the first page of a large equal-key range while
-	 * preserving the normal locked-page free-space recheck in
-	 * RelationGetBufferForTuple().
+	 * Prefer pages whose FSM entry already says they can fit the caller's
+	 * target free-space requirement.  When every clustered neighbor is below
+	 * that normal insert threshold, let RelationGetBufferForTuple() fall back
+	 * to the relation tail instead of consuming fillfactor reserve from many
+	 * unrelated pages.
 	 */
 	if (firstCandidateOnly)
 	{
@@ -1021,6 +1021,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	int			nclusteredTargetBlocks = 0,
 				clusteredTargetIndex = 0;
 	bool		usingClusteredTarget = false;
+	bool		usingClusteredOverflowTarget = false;
 	bool		usingPreferredBlock = false;
 	bool		unlockedTargetBuffer;
 	bool		recheckVmPins;
@@ -1098,7 +1099,8 @@ RelationGetBufferForTuple(Relation relation, Size len,
 		else if (tuple != NULL)
 		{
 			nclusteredTargetBlocks =
-				RelationGetClusteredTargetBlocksForTuple(relation, tuple, len,
+				RelationGetClusteredTargetBlocksForTuple(relation, tuple,
+														 targetFreeSpace,
 														 clusteredTargetBlocks,
 														 lengthof(clusteredTargetBlocks));
 			if (nclusteredTargetBlocks > 0)
@@ -1241,7 +1243,7 @@ loop:
 		}
 
 		pageFreeSpace = PageGetHeapFreeSpace(page);
-		if ((usingClusteredTarget ? len : targetFreeSpace) <= pageFreeSpace)
+		if (targetFreeSpace <= pageFreeSpace)
 		{
 			/* use this page as future insert target, too */
 			RelationSetTargetBlock(relation, targetBlock);
@@ -1283,7 +1285,7 @@ loop:
 				usingPreferredBlock = false;
 				nclusteredTargetBlocks =
 					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
-															 len,
+															 targetFreeSpace,
 															 clusteredTargetBlocks,
 															 lengthof(clusteredTargetBlocks));
 				for (clusteredTargetIndex = 0;
@@ -1311,12 +1313,34 @@ loop:
 				else
 					bistate->next_free++;
 			}
-			else if (use_fsm)
-				targetBlock = GetPageWithFreeSpace(relation, targetFreeSpace);
 			else
-				targetBlock = InvalidBlockNumber;
+			{
+				BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
+
+				if (nblocks > 0)
+				{
+					/*
+					 * Once every clustered neighbor is full, append the
+					 * overflow run at the relation tail instead of scattering
+					 * dense equal-key inserts through unrelated FSM pages.
+					 */
+					targetBlock = nblocks - 1;
+					usingClusteredOverflowTarget = true;
+				}
+				else
+					targetBlock = InvalidBlockNumber;
+			}
 
 			continue;
+		}
+
+		if (usingClusteredOverflowTarget)
+		{
+			if (use_fsm)
+				RecordPageWithFreeSpace(relation, targetBlock,
+										pageFreeSpace);
+			usingClusteredOverflowTarget = false;
+			break;
 		}
 
 		/* Is there an ongoing bulk extension? */

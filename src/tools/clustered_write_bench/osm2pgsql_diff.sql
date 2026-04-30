@@ -30,6 +30,11 @@
 \set heap_fillfactor 90
 \endif
 
+\if :{?order_diff_by_cluster_key}
+\else
+\set order_diff_by_cluster_key false
+\endif
+
 \timing on
 
 drop table if exists clustered_write_osm_diff cascade;
@@ -45,7 +50,8 @@ select (200000 * :scale)::int as base_rows,
        (:'single_key_cluster')::boolean as single_key_cluster,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
-       (:hot_tile_fraction)::numeric as hot_tile_fraction;
+       (:hot_tile_fraction)::numeric as hot_tile_fraction,
+       (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key;
 
 create unlogged table clustered_write_osm_diff_on
 (
@@ -159,7 +165,8 @@ select (200000 * :scale)::int as base_rows,
        (:'single_key_cluster')::boolean as single_key_cluster,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
-       (:hot_tile_fraction)::numeric as hot_tile_fraction;
+       (:hot_tile_fraction)::numeric as hot_tile_fraction,
+       (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key;
 
 create temp table clustered_write_step_timings
 (
@@ -198,12 +205,22 @@ from clustered_write_settings as s,
 insert into clustered_write_step_timings
 values ('clustered_write_insert', clock_timestamp(), null);
 
+\if :order_diff_by_cluster_key
+insert into clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
+select d.osm_id,
+       d.tile_id,
+       1,
+       repeat('insert', 16)
+from clustered_write_diff_inserts as d
+order by d.tile_id, d.osm_id;
+\else
 insert into clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
 select d.osm_id,
        d.tile_id,
        1,
        repeat('insert', 16)
 from clustered_write_diff_inserts as d;
+\endif
 
 update clustered_write_step_timings
 set finished_at = clock_timestamp()
@@ -212,12 +229,22 @@ where step = 'clustered_write_insert';
 insert into clustered_write_step_timings
 values ('without_cluster_metadata_insert', clock_timestamp(), null);
 
+\if :order_diff_by_cluster_key
+insert into clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
+select d.osm_id,
+       d.tile_id,
+       1,
+       repeat('insert', 16)
+from clustered_write_diff_inserts as d
+order by d.tile_id, d.osm_id;
+\else
 insert into clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
 select d.osm_id,
        d.tile_id,
        1,
        repeat('insert', 16)
 from clustered_write_diff_inserts as d;
+\endif
 
 update clustered_write_step_timings
 set finished_at = clock_timestamp()

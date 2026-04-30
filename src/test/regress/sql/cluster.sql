@@ -103,7 +103,8 @@ WHERE pg_class.oid=indexrelid
 	AND pg_class_2.relname = 'clstr_tst'
 	AND indisclustered;
 
--- Verify that clustered writes prefer heap blocks in clustered key order.
+-- Verify that clustered writes do not consume fillfactor reserve when the
+-- clustered key's existing pages are below the normal insert threshold.
 CREATE TABLE clstr_write_btree (id int, k int, filler text) WITH (fillfactor = 10);
 INSERT INTO clstr_write_btree
 SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
@@ -113,7 +114,7 @@ CLUSTER clstr_write_btree USING clstr_write_btree_k_id;
 INSERT INTO clstr_write_btree VALUES (1001, 1, repeat('y', 10));
 SELECT tid_block(new_row.ctid) <=
 	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id <> 1001)
-	AS placed_near_clustered_key
+	AS used_clustered_key_reserve
 FROM clstr_write_btree AS new_row
 WHERE id = 1001;
 DROP TABLE clstr_write_btree;
