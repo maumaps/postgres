@@ -2,8 +2,10 @@ diff --git a/src/command-line-parser.cpp b/src/command-line-parser.cpp
 index 232a70a..4a98592 100644
 --- a/src/command-line-parser.cpp
 +++ b/src/command-line-parser.cpp
-@@ -388,2 +388,8 @@ options_t parse_command_line(int argc, char *argv[])
- 
+@@ -386,6 +386,12 @@ options_t parse_command_line(int argc, char *argv[])
+                       "the columns.")
+         ->group("Pgsql output options");
+
 +    // --cluster-during-import
 +    app.add_flag("--cluster-during-import", options.cluster_during_import)
 +        ->description("Experimental: create a clustered geometry-derived key before "
@@ -11,31 +13,43 @@ index 232a70a..4a98592 100644
 +        ->group("Pgsql output options");
 +
      // --keep-coastlines
+     app.add_flag("-K,--keep-coastlines", options.keep_coastlines)
+         ->description("Keep coastline data (default: discard objects tagged"
 diff --git a/src/options.hpp b/src/options.hpp
 index 4f56bfb..4cc115b 100644
 --- a/src/options.hpp
 +++ b/src/options.hpp
-@@ -138,2 +138,5 @@ struct options_t
- 
+@@ -136,6 +136,9 @@ struct options_t
+
+     bool enable_hstore_index = false; ///< add an index on the hstore column
+
 +    /// create a clustered btree index over a generated geometry key before the first COPY
 +    bool cluster_during_import = false;
 +
      /// Output multi-geometries intead of several simple geometries
+     bool enable_multi = false;
+
 diff --git a/src/output-pgsql.cpp b/src/output-pgsql.cpp
 index 6b250a6..4b38667 100644
 --- a/src/output-pgsql.cpp
 +++ b/src/output-pgsql.cpp
-@@ -513,3 +513,4 @@ output_pgsql_t::output_pgsql_t(std::shared_ptr<middle_query_t> const &mid,
+@@ -511,7 +511,8 @@ output_pgsql_t::output_pgsql_t(std::shared_ptr<middle_query_t> const &mid,
+         m_tables.at(i) = std::make_unique<table_t>(
+             name, type, columns, options.hstore_columns,
              options.projection->target_srs(), options.append,
 -            options.hstore_mode, copy_thread, options.output_dbschema);
 +            options.hstore_mode, copy_thread, options.output_dbschema,
 +            options.cluster_during_import);
      }
+ }
+
 diff --git a/src/table.cpp b/src/table.cpp
-index 6b65eb9..72276b3 100644
+index 6b65eb9..f03f38b 100644
 --- a/src/table.cpp
 +++ b/src/table.cpp
-@@ -29,6 +29,7 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
+@@ -27,10 +27,11 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
+                  hstores_t hstore_columns, int const srid, bool const append,
+                  hstore_column hstore_mode,
                   std::shared_ptr<db_copy_thread_t> const &copy_thread,
 -                 std::string const &schema)
 +                 std::string const &schema, bool const cluster_during_import)
@@ -45,15 +59,23 @@ index 6b65eb9..72276b3 100644
 +  m_hstore_mode(hstore_mode), m_cluster_during_import(cluster_during_import),
 +  m_columns(std::move(columns)),
    m_hstore_columns(std::move(hstore_columns)), m_copy(copy_thread)
-@@ -47,3 +48,5 @@ table_t::table_t(table_t const &other,
+ {
+     // if we dont have any columns
+@@ -45,7 +46,9 @@ table_t::table_t(table_t const &other,
+                  std::shared_ptr<db_copy_thread_t> const &copy_thread)
+ : m_connection_params(other.m_connection_params), m_target(other.m_target),
    m_type(other.m_type), m_srid(other.m_srid), m_append(other.m_append),
 -  m_hstore_mode(other.m_hstore_mode), m_columns(other.m_columns),
 +  m_hstore_mode(other.m_hstore_mode),
 +  m_cluster_during_import(other.m_cluster_during_import),
 +  m_columns(other.m_columns),
    m_hstore_columns(other.m_hstore_columns), m_table_space(other.m_table_space),
-@@ -120,3 +123,13 @@ void table_t::start(connection_params_t const &connection_params,
- 
+   m_copy(copy_thread)
+ {
+@@ -118,18 +121,52 @@ void table_t::start(connection_params_t const &connection_params,
+             sql += "\"tags\" hstore,";
+         }
+
 -        sql += fmt::format("way geometry({},{}) )", m_type, m_srid);
 +        sql += fmt::format("way geometry({},{})", m_type, m_srid);
 +
@@ -66,9 +88,25 @@ index 6b65eb9..72276b3 100644
 +        }
 +
 +        sql += " )";
- 
-@@ -132,2 +145,20 @@ void table_t::start(connection_params_t const &connection_params,
- 
+
+         // The final tables are created with CREATE TABLE AS ... SELECT * FROM ...
+         // This means that they won't get this autovacuum setting, so it doesn't
+-        // doesn't need to be RESET on these tables
+-        sql += " WITH (autovacuum_enabled = off)";
++        // doesn't need to be RESET on these tables.  Clustered import keeps the
++        // first heap layout, so leave room for later diff rows in the same key
++        // ranges instead of filling all clustered pages during COPY.
++        if (m_cluster_during_import) {
++            sql += " WITH (autovacuum_enabled = off, fillfactor = 90)";
++        } else {
++            sql += " WITH (autovacuum_enabled = off)";
++        }
+         //add the main table space
+         sql += m_table_space;
+
+         //create the table
+         m_db_connection->exec(sql);
+
 +        if (m_cluster_during_import) {
 +            auto const idx_name = m_target->name() + "_cluster_key_idx";
 +            auto const quoted_idx_name = fmt::format(R"("{}")", idx_name);
@@ -88,25 +126,29 @@ index 6b65eb9..72276b3 100644
 +        }
 +
          if (m_srid != "4326") {
-@@ -192,13 +223,18 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
- 
+             create_geom_check_trigger(*m_db_connection, m_target->schema(),
+                                       m_target->name(), "ST_IsValid(NEW.way)");
+@@ -190,17 +227,22 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
+                                     m_target->name());
+         }
+
 -        log_info("Clustering table '{}' by geometry...", m_target->name());
 +        if (m_cluster_during_import) {
 +            log_info("Keeping table '{}' in clustered import order...",
 +                     m_target->name());
 +        } else {
 +            log_info("Clustering table '{}' by geometry...", m_target->name());
- 
+
 -        std::string const sql =
 -            fmt::format("CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
 -                        qual_tmp_name, m_table_space, qual_name);
 +            std::string const sql = fmt::format(
 +                "CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
 +                qual_tmp_name, m_table_space, qual_name);
- 
+
 -        m_db_connection->exec(sql);
 +            m_db_connection->exec(sql);
- 
+
 -        m_db_connection->exec("DROP TABLE {}", qual_name);
 -        m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")", qual_tmp_name,
 -                              m_target->name());
@@ -114,17 +156,27 @@ index 6b65eb9..72276b3 100644
 +            m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")",
 +                                  qual_tmp_name, m_target->name());
 +        }
- 
+
+         log_info("Creating geometry index on table '{}'...", m_target->name());
+
 diff --git a/src/table.hpp b/src/table.hpp
 index db0f73f..122e1b5 100644
 --- a/src/table.hpp
 +++ b/src/table.hpp
-@@ -34,3 +34,3 @@ public:
+@@ -32,7 +32,7 @@ public:
+             hstores_t hstore_columns, int srid, bool append,
+             hstore_column hstore_mode,
              std::shared_ptr<db_copy_thread_t> const &copy_thread,
 -            std::string const &schema);
 +            std::string const &schema, bool cluster_during_import);
- 
-@@ -79,2 +79,3 @@ private:
+
+     table_t(table_t const &other,
+             std::shared_ptr<db_copy_thread_t> const &copy_thread);
+@@ -77,6 +77,7 @@ private:
+     std::string m_srid;
+     bool m_append;
      hstore_column m_hstore_mode;
 +    bool m_cluster_during_import;
      columns_t m_columns;
+     hstores_t m_hstore_columns;
+     std::string m_table_space;

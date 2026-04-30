@@ -112,3 +112,24 @@ select table_name,
 from geohash_blocks
 group by table_name
 order by table_name;
+
+\echo 'clustered import diagnostics'
+
+select relname, reloptions
+from pg_class
+where relname in ('planet_osm_point',
+                  'planet_osm_line',
+                  'planet_osm_polygon',
+                  'planet_osm_roads')
+order by relname;
+
+analyze planet_osm_point;
+analyze planet_osm_line;
+analyze planet_osm_polygon;
+analyze planet_osm_roads;
+
+select tablename, correlation
+from pg_stats
+where schemaname = 'public'
+  and attname = 'osm2pgsql_cluster_key'
+order by tablename;

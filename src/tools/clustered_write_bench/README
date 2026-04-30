@@ -139,13 +139,15 @@ append runs.
 One verified run used planet daily diff `000/004/978.osc.gz`, Geofabrik
 Georgia, stock osm2pgsql `2.2.0`, and `OSM2PGSQL_CACHE_MB=1024`
 `OSM2PGSQL_PROCS=2`.  The `baseline_stock` row was PostgreSQL `18.3` with
-PostGIS `3.6`; the `patched_stock` row was this branch's PostgreSQL `19devel`
-build with locally built PostGIS `3.7.0dev`.
+PostGIS `3.6`; the patched rows used this branch's PostgreSQL `19devel` build
+with locally built PostGIS `3.7.0dev`.
 
 | variant | create elapsed | append elapsed | database size |
 | --- | ---: | ---: | ---: |
 | baseline_stock | 2:13.29 | 2:43.53 | 2726 MB |
 | patched_stock | 2:54.12 | 2:41.17 | 2728 MB |
+| patched_clustered_import, no heap fillfactor reserve | 2:10.09 | 2:22.13 | 2776 MB |
+| patched_clustered_import, heap fillfactor 90 | 1:21.37 | 2:00.01 | 2780 MB |
 
 Read/locality summary from the same run:
 
@@ -153,6 +155,8 @@ Read/locality summary from the same run:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | baseline_stock | 213.205 ms | 608.002 ms | 1289.247 ms | 584.712 ms | 2784.592 ms | 20463.716 ms | 7 / 2381 | 6 / 1002 | 32 / 1208 |
 | patched_stock | 267.111 ms | 2381.184 ms | 1144.408 ms | 99.757 ms | 2215.158 ms | 9645.548 ms | 7 / 2381 | 6 / 1002 | 32 / 1208 |
+| patched_clustered_import, no heap fillfactor reserve | 332.595 ms | 631.841 ms | 972.157 ms | 98.546 ms | 1576.143 ms | 6123.307 ms | 13 / 15394 | 16 / 2207 | 10 / 20402 |
+| patched_clustered_import, heap fillfactor 90 | 226.063 ms | 619.446 ms | 1040.034 ms | 135.411 ms | 1716.965 ms | 6396.165 ms | 9 / 15396.5 | 13 / 2212 | 9 / 20314.5 |
 
 The current result is mixed rather than a victory lap: the patched run keeps
 append time roughly flat and improves the exact polygon/roads reads in this
@@ -162,12 +166,24 @@ validates the end-to-end harness and PostgreSQL/PostGIS compatibility; it does
 not yet prove that stock osm2pgsql diff imports preserve clustered geometry
 layout better.
 
+The experimental clustered-import path is more promising on write time and
+spatial reads in this run.  Adding heap `fillfactor=90` to those import tables
+left real reserve space (`reloptions` reported
+`{autovacuum_enabled=off,fillfactor=90}`) and reduced the compactness metric
+from `13/16/10` p95 blocks to `9/13/9` for line/point/polygon.  It did not fix
+the long p95 heap span, and `pg_stats.correlation` for
+`osm2pgsql_cluster_key` stayed low or negative (`line=-0.0757`,
+`point=-0.2435`, `polygon=-0.6679`, `roads=-0.0230`).  That means the current
+pre-COPY clustered btree helps repeated-key placement and leaves room for
+diffs, but it is not a replacement for actually sorting or buffering the
+initial COPY stream by geometry key.
+
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
 checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
 adds `--cluster-during-import`, creates a generated geometry-derived geohash key
-and a clustered btree index before the first COPY, and skips osm2pgsql's final
-table rewrite.
+and a clustered btree index before the first COPY, creates the heap with
+`fillfactor=90`, and skips osm2pgsql's final table rewrite.
 
 Directly clustering the import tables with a pre-COPY GiST index on `way` was
 also tested as a negative control.  It worked functionally, but maintaining the
