@@ -53,6 +53,52 @@ static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
 													int maxTargetBlocks);
 
 /*
+ * RelationCanUseClusteredTargetProbe
+ *
+ * Return true when the remembered clustered index can support tuple-anchored
+ * target-block probes.  Keep this in sync with the stronger per-tuple checks
+ * in RelationGetClusteredTargetBlocksFromIndex(), so callers can skip batch
+ * allocation and per-tuple work when the clustered index is not usable for
+ * heap page placement.
+ */
+bool
+RelationCanUseClusteredTargetProbe(Relation relation, Relation indexRelation)
+{
+	int			nkeys;
+
+	if (IsBootstrapProcessingMode() || indexRelation == NULL)
+		return false;
+
+	if (relation->rd_rel->relkind != RELKIND_RELATION &&
+		relation->rd_rel->relkind != RELKIND_MATVIEW)
+		return false;
+
+	if (indexRelation->rd_index->indrelid != RelationGetRelid(relation) ||
+		indexRelation->rd_rel->relam != BTREE_AM_OID ||
+		!indexRelation->rd_indam->amclusterable ||
+		indexRelation->rd_indam->amgettuple == NULL ||
+		!indexRelation->rd_index->indisvalid ||
+		!indexRelation->rd_index->indisready ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indexprs, NULL) ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indpred, NULL))
+		return false;
+
+	nkeys = indexRelation->rd_index->indnkeyatts;
+	if (nkeys <= 0 || nkeys > INDEX_MAX_KEYS)
+		return false;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		if (indexRelation->rd_index->indkey.values[i] <= 0)
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * RelationPutHeapTuple - place tuple at specified page
  *
  * !!! EREPORT(ERROR) IS DISALLOWED HERE !!!  Must PANIC on failure!!!
@@ -185,71 +231,49 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		tuple == NULL || len > MaxHeapTupleSize)
 		return 0;
 
-	if (relation->rd_rel->relkind != RELKIND_RELATION &&
-		relation->rd_rel->relkind != RELKIND_MATVIEW)
+	if (!RelationCanUseClusteredTargetProbe(relation, indexRelation))
 		return 0;
-
-	if (indexRelation->rd_index->indrelid != RelationGetRelid(relation) ||
-		indexRelation->rd_rel->relam != BTREE_AM_OID ||
-		!indexRelation->rd_indam->amclusterable ||
-		indexRelation->rd_indam->amgettuple == NULL ||
-		!indexRelation->rd_index->indisvalid ||
-		!indexRelation->rd_index->indisready ||
-		!heap_attisnull(indexRelation->rd_indextuple,
-						Anum_pg_index_indpred, NULL))
-	{
-		return 0;
-	}
 
 	nkeys = indexRelation->rd_index->indnkeyatts;
-	if (nkeys <= 0 || nkeys > INDEX_MAX_KEYS)
-	{
-		return 0;
-	}
 	nblocks = RelationGetNumberOfBlocks(relation);
 
-	if (heap_attisnull(indexRelation->rd_indextuple,
-					   Anum_pg_index_indexprs, NULL))
+	useBtreePrefixProbe = true;
+
+	for (int i = 0; i < nkeys; i++)
 	{
-		useBtreePrefixProbe = true;
+		AttrNumber	attnum = indexRelation->rd_index->indkey.values[i];
+		Datum		value;
+		bool		isnull;
+		Oid			eqOperator;
+		RegProcedure eqProcedure;
 
-		for (int i = 0; i < nkeys; i++)
-		{
-			AttrNumber	attnum = indexRelation->rd_index->indkey.values[i];
-			Datum		value;
-			bool		isnull;
-			Oid			eqOperator;
-			RegProcedure eqProcedure;
+		Assert(attnum > 0);
 
-			if (attnum <= 0)
-				break;
+		value = heap_getattr(tuple, attnum, relation->rd_att, &isnull);
+		if (isnull)
+			break;
 
-			value = heap_getattr(tuple, attnum, relation->rd_att, &isnull);
-			if (isnull)
-				break;
+		eqOperator = get_opfamily_member(indexRelation->rd_opfamily[i],
+										 indexRelation->rd_opcintype[i],
+										 indexRelation->rd_opcintype[i],
+										 BTEqualStrategyNumber);
+		if (!OidIsValid(eqOperator))
+			break;
 
-			eqOperator = get_opfamily_member(indexRelation->rd_opfamily[i],
-											 indexRelation->rd_opcintype[i],
-											 indexRelation->rd_opcintype[i],
-											 BTEqualStrategyNumber);
-			if (!OidIsValid(eqOperator))
-				break;
+		eqProcedure = get_opcode(eqOperator);
+		if (!RegProcedureIsValid(eqProcedure))
+			break;
 
-			eqProcedure = get_opcode(eqOperator);
-			if (!RegProcedureIsValid(eqProcedure))
-				break;
-
-			ScanKeyInit(&skey[i],
-						i + 1,
-						BTEqualStrategyNumber,
-						eqProcedure,
-						value);
-			nscankeys++;
-		}
-
-		if (nscankeys == 0)
-			useBtreePrefixProbe = false;
+		ScanKeyInit(&skey[i],
+					i + 1,
+					BTEqualStrategyNumber,
+					eqProcedure,
+					value);
+		nscankeys++;
 	}
+
+	if (nscankeys == 0)
+		useBtreePrefixProbe = false;
 
 	if (!useBtreePrefixProbe)
 		return 0;

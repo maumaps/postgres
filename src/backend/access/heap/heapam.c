@@ -195,6 +195,7 @@ heap_clustered_write_index_can_sort(Relation relation, Relation indexRelation)
 
 	if (indexRelation->rd_index->indrelid != RelationGetRelid(relation) ||
 		indexRelation->rd_rel->relam != GIST_AM_OID ||
+		!indexRelation->rd_indam->amclusterable ||
 		!indexRelation->rd_index->indisvalid ||
 		!indexRelation->rd_index->indisready ||
 		!heap_attisnull(indexRelation->rd_indextuple,
@@ -2519,10 +2520,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				clusteredIndexRelation =
 					try_index_open(clusteredIndexOid, AccessShareLock);
 		}
-		if (clusteredIndexRelation != NULL &&
-			clusteredIndexRelation->rd_rel->relam == BTREE_AM_OID &&
-			heap_attisnull(clusteredIndexRelation->rd_indextuple,
-						   Anum_pg_index_indexprs, NULL))
+		if (RelationCanUseClusteredTargetProbe(relation,
+											   clusteredIndexRelation))
 			use_clustered_target_probe = true;
 		else if (heap_clustered_write_index_can_sort(relation,
 													 clusteredIndexRelation))
