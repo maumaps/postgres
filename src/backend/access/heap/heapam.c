@@ -58,6 +58,7 @@
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/sortsupport.h"
@@ -85,6 +86,12 @@ typedef struct HeapTupleClusteredSortContext
 	/* Comparator support functions should not leak into the caller context. */
 	MemoryContext compareCxt;
 } HeapTupleClusteredSortContext;
+
+typedef struct HeapTupleClusteredTargetCacheEntry
+{
+	Datum		prefixValue;
+	BlockNumber targetBlock;
+} HeapTupleClusteredTargetCacheEntry;
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
@@ -2547,6 +2554,12 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		use_clustered_sort = false;
 		bool		has_clustered_target = false;
 		bool		has_clustered_sort = false;
+		AttrNumber	prefixCacheAttnum = InvalidAttrNumber;
+		Oid			prefixCacheCollation = InvalidOid;
+		RegProcedure prefixCacheEqProc = InvalidOid;
+		HeapTupleClusteredTargetCacheEntry *prefixTargetCache = NULL;
+		MemoryContext prefixCacheCompareCxt = NULL;
+		int			nprefixTargetCache = 0;
 
 		if (!IsBootstrapProcessingMode())
 		{
@@ -2564,6 +2577,44 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 		if (use_clustered_target_probe || use_clustered_sort)
 		{
+			/*
+			 * Composite clustered indexes commonly group many batch tuples by
+			 * the leading key, while the trailing key is a new object id.  A
+			 * small per-batch cache avoids repeating the same anchored prefix
+			 * probe for every tuple in that group.  The equality function may
+			 * detoast or allocate, so comparisons run in a resettable context.
+			 */
+			if (use_clustered_target_probe &&
+				clusteredIndexRelation->rd_index->indnkeyatts > 1)
+			{
+				Oid			eqOperator;
+
+				prefixCacheAttnum =
+					clusteredIndexRelation->rd_index->indkey.values[0];
+				prefixCacheCollation =
+					clusteredIndexRelation->rd_indcollation[0];
+				eqOperator =
+					get_opfamily_member(clusteredIndexRelation->rd_opfamily[0],
+										clusteredIndexRelation->rd_opcintype[0],
+										clusteredIndexRelation->rd_opcintype[0],
+										BTEqualStrategyNumber);
+				if (OidIsValid(eqOperator))
+					prefixCacheEqProc = get_opcode(eqOperator);
+				if (prefixCacheAttnum <= 0 ||
+					!RegProcedureIsValid(prefixCacheEqProc))
+					prefixCacheAttnum = InvalidAttrNumber;
+				else
+				{
+					prefixTargetCache =
+						palloc_array(HeapTupleClusteredTargetCacheEntry,
+									 ntuples);
+					prefixCacheCompareCxt =
+						AllocSetContextCreate(CurrentMemoryContext,
+											  "clustered target cache compare",
+											  ALLOCSET_DEFAULT_SIZES);
+				}
+			}
+
 			clustered = palloc_array(HeapTupleClusteredWriteItem, ntuples);
 			for (i = 0; i < ntuples; i++)
 			{
@@ -2573,14 +2624,64 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				if (use_clustered_target_probe)
 				{
 					BlockNumber targetBlock;
+					Datum		prefixValue = (Datum) 0;
+					bool		prefixIsNull = true;
+					bool		foundCachedTarget = false;
 
-					if (RelationGetClusteredTargetBlocksFromIndex(relation,
-																  clusteredIndexRelation,
-																  heaptuples[i],
-																  heaptuples[i]->t_len,
-																  &targetBlock,
-																  1) > 0)
-						clustered[i].targetBlock = targetBlock;
+					if (prefixTargetCache != NULL)
+					{
+						prefixValue =
+							heap_getattr(heaptuples[i],
+										 prefixCacheAttnum,
+										 relation->rd_att,
+										 &prefixIsNull);
+						if (!prefixIsNull)
+						{
+							for (int j = 0; j < nprefixTargetCache; j++)
+							{
+								bool		equal;
+								MemoryContext oldcontext;
+
+								oldcontext =
+									MemoryContextSwitchTo(prefixCacheCompareCxt);
+								equal =
+									DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																	  prefixCacheCollation,
+																	  prefixTargetCache[j].prefixValue,
+																	  prefixValue));
+								MemoryContextSwitchTo(oldcontext);
+								MemoryContextReset(prefixCacheCompareCxt);
+
+								if (equal)
+								{
+									clustered[i].targetBlock =
+										prefixTargetCache[j].targetBlock;
+									foundCachedTarget = true;
+									break;
+								}
+							}
+						}
+					}
+
+					if (!foundCachedTarget)
+					{
+						if (RelationGetClusteredTargetBlocksFromIndex(relation,
+																	  clusteredIndexRelation,
+																	  heaptuples[i],
+																	  heaptuples[i]->t_len,
+																	  &targetBlock,
+																	  1) > 0)
+							clustered[i].targetBlock = targetBlock;
+
+						if (prefixTargetCache != NULL && !prefixIsNull)
+						{
+							prefixTargetCache[nprefixTargetCache].prefixValue =
+								prefixValue;
+							prefixTargetCache[nprefixTargetCache].targetBlock =
+								clustered[i].targetBlock;
+							nprefixTargetCache++;
+						}
+					}
 				}
 				clustered[i].inputIndex = i;
 				if (clustered[i].targetBlock != InvalidBlockNumber)
@@ -2617,6 +2718,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				MemoryContextDelete(sortContext.sortCxt);
 
 			pfree(clustered);
+			if (prefixTargetCache != NULL)
+			{
+				pfree(prefixTargetCache);
+				MemoryContextDelete(prefixCacheCompareCxt);
+			}
 		}
 
 		if (clusteredIndexRelation != NULL)
