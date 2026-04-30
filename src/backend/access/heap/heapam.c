@@ -240,6 +240,9 @@ heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
 static bool
 heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid)
 {
+	if (!get_typbyval(typeOid))
+		return false;
+
 	switch (typeOid)
 	{
 		case INT2OID:

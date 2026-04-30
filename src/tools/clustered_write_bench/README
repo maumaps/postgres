@@ -192,6 +192,15 @@ Do not repeat these paths blindly:
   tested built-in types, adding the branch to ordinary prefix-cache hits did
   not help the workload; hot `0.9` and `1.0` smoke timings got worse while
   locality stayed unchanged.
+* **Near-FSM fallback after clustered candidate exhaustion:** rejected.  Using
+  `RecordAndGetPageWithFreeSpace()` near the last attempted clustered page
+  looked like a cheap way to keep duplicate-key overflow physically close, but
+  the scale `1` single-key run made hot `0.9`/`1.0` inserts about `2.2s` with
+  no hot-row locality gain.
+* **Skipping the whole batch when one hot prefix dominates:** rejected.  A
+  `hotPrefixTupleCount > ntuples / 2` variant avoided preserving the small
+  non-hot tail, but it did not beat the kept all-hot-only guard and did not
+  improve hot-row locality.
 * **Btree batch sorting before target probes:** rejected on the real Georgia
   osm2pgsql run (`3:14.39` create, `4:08.59` append).  For this workload,
   btree target-page probing beats sorting the batch first.
