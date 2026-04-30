@@ -95,6 +95,7 @@ static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
 													Size len,
 													BlockNumber *targetBlocks,
 													int maxTargetBlocks,
+													bool firstCandidateOnly,
 													bool *clusteredCandidatesExhausted);
 static bool ClusteredWriteGetCachedOverflowTarget(Relation relation,
 												  HeapTuple tuple,
@@ -885,6 +886,7 @@ RelationGetClusteredTargetBlocksForTuple(Relation relation, HeapTuple tuple,
 										 Size len,
 										 BlockNumber *targetBlocks,
 										 int maxTargetBlocks,
+										 bool firstCandidateOnly,
 										 bool *clusteredCandidatesExhausted)
 {
 	Oid			indexOid;
@@ -907,7 +909,7 @@ RelationGetClusteredTargetBlocksForTuple(Relation relation, HeapTuple tuple,
 														 tuple, len,
 														 targetBlocks,
 														 maxTargetBlocks,
-														 false,
+														 firstCandidateOnly,
 														 clusteredCandidatesExhausted);
 
 	index_close(indexRelation, AccessShareLock);
@@ -1447,14 +1449,24 @@ RelationGetBufferForTuple(Relation relation, Size len,
 				usingClusteredOverflowTarget = true;
 			else
 			{
+				/*
+				 * Start with the same cheap first-candidate probe that
+				 * heap_multi_insert uses during batch preparation.  If that
+				 * page is full, the fallback below pays for the full bounded
+				 * candidate window only when it is actually needed.
+				 */
 				nclusteredTargetBlocks =
 					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
 															 clusteredTargetFreeSpace,
 															 clusteredTargetBlocks,
 															 lengthof(clusteredTargetBlocks),
+															 true,
 															 &clusteredCandidatesExhausted);
 				if (nclusteredTargetBlocks > 0)
+				{
 					targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+					usingPreferredBlock = true;
+				}
 				else if (clusteredCandidatesExhausted)
 				{
 					BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
@@ -1672,6 +1684,7 @@ loop:
 															 clusteredTargetFreeSpace,
 															 clusteredTargetBlocks,
 															 lengthof(clusteredTargetBlocks),
+															 false,
 															 &clusteredCandidatesExhausted);
 				for (clusteredTargetIndex = 0;
 					 clusteredTargetIndex < nclusteredTargetBlocks;

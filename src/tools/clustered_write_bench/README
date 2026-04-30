@@ -82,12 +82,17 @@ duplicate-key cost is no longer the main problem: integer fillfactor `90`
 `hot=0.9` clustered insert was `165.92 ms` median versus `120.71 ms` for the
 control, while fillfactor `50` was `216.97 ms` versus `151.09 ms`.  Generated
 text keys stayed in the same class (`222.00 ms` versus `175.87 ms` at
-fillfactor `90`, `273.00 ms` versus `200.61 ms` at fillfactor `50`).  The
-ordinary non-hot single-key case is still the expensive one: it preserves
-`83.97%` to `100%` locality, but clustered insert medians were roughly
-`614-1205 ms` depending on key type and fillfactor, compared to `158-296 ms`
-for the control.  Treat further work as a cost-reduction problem for
-clustered target probes, not primarily as another hot-prefix overflow fix.
+fillfactor `90`, `273.00 ms` versus `200.61 ms` at fillfactor `50`).  After
+making single-row `INSERT ... SELECT` use a lazy first-candidate target probe,
+the ordinary non-hot single-key case is also in a better cost class while
+preserving the same locality: integer clustered insert medians were
+`227.90 ms` / `218.98 ms` at fillfactor `90` / `50` unordered and
+`329.28 ms` / `212.22 ms` ordered; generated text keys were `300.35 ms` /
+`446.83 ms` unordered and `397.13 ms` / `408.36 ms` ordered.  The matching
+control medians were still lower (`83.67-199.65 ms`), but the previous
+`614-1205 ms` clustered range is gone without losing `83.97%` to `100%`
+inside-base locality.  The focused raw run is under
+`/home/kom/tmp/clustered-write-synthetic/lazy-single-row-first-candidate-focused-20260501-023105/`.
 
 Set `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` to run the insert diff
 with an explicit `ORDER BY tile_id, osm_id`.  This is a diagnostic upper bound
@@ -363,8 +368,9 @@ Do not repeat these paths blindly:
   multi-insert preparation path only needs a preferred first block.  Computing
   the full bounded target-page list before the insertion loop moved too much
   index work onto every tuple.  The kept design does a cheap first-candidate
-  batch probe and leaves the full bounded candidate window for the lazy
-  full-page fallback in `RelationGetBufferForTuple()`.
+  probe for both batch preparation and single-row insert setup, then leaves the
+  full bounded candidate window for the lazy full-page fallback in
+  `RelationGetBufferForTuple()`.
 * **Repointing the rest of a batch after a preferred page is full:** rejected
   on hot duplicate-key smokes.  It did not produce a useful locality gain and
   made scale `0.1` hot-tile insert timings worse.
@@ -511,6 +517,21 @@ Do not repeat these paths blindly:
   composite text fillfactor `90`, and from `317.57 ms` to `398.11 ms` for
   single text fillfactor `90`.  The raw focused run is under
   `/home/kom/tmp/clustered-write-synthetic/single-row-target-cache-focused-20260430-230337/`.
+* **Lazy first-candidate single-row target probes:** fixed the later non-hot
+  single-row cost problem without adding persistent target-block cache state.
+  `RelationGetBufferForTuple()` now starts `INSERT ... SELECT` clustered
+  placement with one cheap candidate, just like `heap_multi_insert` batch
+  preparation, and pays for the full bounded forward/backward candidate window
+  only if that first page is actually full.  In the focused scale `1`, repeat
+  `3`, single-key hot `0` matrix, clustered insert medians fell into the
+  `212.22-446.83 ms` range while preserving the same `83.97-100%` locality.
+  A hot `0.9/1.0` repeat `2` follow-up kept insert medians near the control
+  (`90.14-147.79 ms` clustered versus `62.39-115.53 ms` control) and retained
+  the previous compact-tail shape for rows outside the base range.  Raw gzip
+  outputs are under
+  `/home/kom/tmp/clustered-write-synthetic/lazy-single-row-first-candidate-focused-20260501-023105/`
+  and
+  `/home/kom/tmp/clustered-write-synthetic/lazy-single-row-first-candidate-hot-20260501-023331/`.
 * **Cached overflow leading-key metadata in `rd_amcache`:** rejected as a
   follow-up optimization to the overflow cache.  The prototype kept the leading
   clustered-index attribute, collation, equality procedure, and type storage
