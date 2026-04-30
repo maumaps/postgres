@@ -598,6 +598,22 @@ Do not repeat these paths blindly:
   experiment was reverted and `tmp_install` was rebuilt from the clean branch.
   The crash log and compressed raw output are under
   `/home/kom/tmp/clustered-write-synthetic/lazy-prefix-count-nonhot-copy-20260501-030413/`.
+* **Reusing the prefix-count hash slot for COPY target-cache lookup:**
+  rejected.  This was a narrower follow-up to the direct `prefixCountSlots`
+  target-cache shortcut: it reused only the already computed direct-mapped hash
+  slot, while still extracting the tuple prefix and verifying every target-cache
+  hit with the clustered btree equality function.  That kept locality unchanged
+  and looked promising in a scale `1`, repeat `3` matrix for some text cases
+  (`ff50` unordered `414.22 ms` to `319.11 ms`, `ff90` ordered `257.94 ms` to
+  `198.32 ms`), but it regressed several integer cases and did not survive the
+  focused text unordered recheck.  A repeat `6` text-key run measured `ff50`
+  unordered at `405.01 ms`, effectively the old shape, and `ff90` unordered at
+  `410.60 ms` versus the kept `324.91 ms`.  The code experiment was reverted
+  and `tmp_install` was rebuilt from the clean branch; raw gzip outputs are
+  under
+  `/home/kom/tmp/clustered-write-synthetic/reuse-prefix-hash-slot-copy-20260501-031244/`
+  and
+  `/home/kom/tmp/clustered-write-synthetic/reuse-prefix-hash-slot-text-unordered-rerun-20260501-031521/`.
 * **Raising COPY's buffered byte limit to reach the tuple limit:** rejected.
   The idea was to let clustered COPY batches get closer to the existing
   `1000`-tuple cap instead of flushing around `65535` bytes, giving the
