@@ -15,6 +15,11 @@
 \set single_key_cluster false
 \endif
 
+\if :{?hot_tile_fraction}
+\else
+\set hot_tile_fraction 0
+\endif
+
 \timing on
 
 drop table if exists clustered_write_osm_diff cascade;
@@ -27,7 +32,8 @@ select (200000 * :scale)::int as base_rows,
        (20000 * :scale)::int as update_rows,
        (4096 * :scale)::int as tile_count,
        (:'use_brin')::boolean as brin_enabled,
-       (:'single_key_cluster')::boolean as single_key_cluster;
+       (:'single_key_cluster')::boolean as single_key_cluster,
+       (:hot_tile_fraction)::numeric as hot_tile_fraction;
 
 create unlogged table clustered_write_osm_diff_on
 (
@@ -113,7 +119,8 @@ select (200000 * :scale)::int as base_rows,
        (20000 * :scale)::int as update_rows,
        (4096 * :scale)::int as tile_count,
        (:'use_brin')::boolean as brin_enabled,
-       (:'single_key_cluster')::boolean as single_key_cluster;
+       (:'single_key_cluster')::boolean as single_key_cluster,
+       (:hot_tile_fraction)::numeric as hot_tile_fraction;
 
 create temp table clustered_write_step_timings
 (
@@ -141,7 +148,10 @@ group by tile_id;
 
 create temp table clustered_write_diff_inserts as
 select s.base_rows + g as osm_id,
-       (((g::bigint * 1103515245 + 12345) % s.tile_count) + 1)::int as tile_id
+       case
+         when g <= (s.insert_rows * s.hot_tile_fraction)::int then 1
+         else (((g::bigint * 1103515245 + 12345) % s.tile_count) + 1)::int
+       end as tile_id
 from clustered_write_settings as s,
      generate_series(1, s.insert_rows) as g;
 

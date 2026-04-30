@@ -13,6 +13,7 @@ REPEATS=${REPEATS:-3}
 SCALE_VALUES=${SCALE_VALUES:-"0.1 1"}
 BRIN_VALUES=${BRIN_VALUES:-"false true"}
 SINGLE_KEY_VALUES=${SINGLE_KEY_VALUES:-"false"}
+HOT_TILE_FRACTION_VALUES=${HOT_TILE_FRACTION_VALUES:-"0"}
 OUTDIR=${OUTDIR:-"$HOME/tmp/clustered-write-synthetic/$(date +%Y%m%d-%H%M%S)"}
 
 mkdir -p "$OUTDIR/raw"
@@ -52,20 +53,22 @@ locality_tsv="$OUTDIR/locality.tsv"
 timing_summary_tsv="$OUTDIR/timing_summary.tsv"
 locality_summary_tsv="$OUTDIR/locality_summary.tsv"
 
-printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\tstep\telapsed_ms\n' >"$timings_tsv"
-printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
+printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\thot_tile_fraction\tstep\telapsed_ms\n' >"$timings_tsv"
+printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\thot_tile_fraction\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
 
 for scale in $SCALE_VALUES; do
 	for brin in $BRIN_VALUES; do
 		for single_key in $SINGLE_KEY_VALUES; do
-			for run in $(seq 1 "$REPEATS"); do
-				raw="$OUTDIR/raw/scale-${scale}_brin-${brin}_single-key-${single_key}_run-${run}.out"
+			for hot_tile_fraction in $HOT_TILE_FRACTION_VALUES; do
+				for run in $(seq 1 "$REPEATS"); do
+					raw="$OUTDIR/raw/scale-${scale}_brin-${brin}_single-key-${single_key}_hot-tile-${hot_tile_fraction}_run-${run}.out"
 
-				"$PSQL" -X -v ON_ERROR_STOP=1 \
-					-v scale="$scale" \
-					-v use_brin="$brin" \
-					-v single_key_cluster="$single_key" \
-					-d "$DBNAME" >"$raw" <<SQL
+					"$PSQL" -X -v ON_ERROR_STOP=1 \
+						-v scale="$scale" \
+						-v use_brin="$brin" \
+						-v single_key_cluster="$single_key" \
+						-v hot_tile_fraction="$hot_tile_fraction" \
+						-d "$DBNAME" >"$raw" <<SQL
 \\pset format unaligned
 \\pset border 0
 \\pset footer off
@@ -73,28 +76,31 @@ for scale in $SCALE_VALUES; do
 \\i $SCRIPT_DIR/osm2pgsql_diff.sql
 SQL
 
-				awk -F'|' \
-					-v run="$run" \
-					-v scale="$scale" \
-					-v brin="$brin" \
-					-v single_key="$single_key" \
-					'$2 == "clustered_write_insert" ||
-					 $2 == "clustered_write_update" ||
-					 $2 == "without_cluster_metadata_insert" ||
-					 $2 == "without_cluster_metadata_update" {
-						printf "%s\t%s\t%s\t%s\t%s\t%s\n", run, scale, brin, single_key, $2, $3
-					}' "$raw" >>"$timings_tsv"
+					awk -F'|' \
+						-v run="$run" \
+						-v scale="$scale" \
+						-v brin="$brin" \
+						-v single_key="$single_key" \
+						-v hot_tile_fraction="$hot_tile_fraction" \
+						'$2 == "clustered_write_insert" ||
+						 $2 == "clustered_write_update" ||
+						 $2 == "without_cluster_metadata_insert" ||
+						 $2 == "without_cluster_metadata_update" {
+							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", run, scale, brin, single_key, hot_tile_fraction, $2, $3
+						}' "$raw" >>"$timings_tsv"
 
-				awk -F'|' \
-					-v run="$run" \
-					-v scale="$scale" \
-					-v brin="$brin" \
-					-v single_key="$single_key" \
-					'$2 == "clustered_write" ||
-					 $2 == "without_cluster_metadata" {
-						printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-							run, scale, brin, single_key, $2, $3, $4, $5, $6, $7, $8, $9
-					}' "$raw" >>"$locality_tsv"
+					awk -F'|' \
+						-v run="$run" \
+						-v scale="$scale" \
+						-v brin="$brin" \
+						-v single_key="$single_key" \
+						-v hot_tile_fraction="$hot_tile_fraction" \
+						'$2 == "clustered_write" ||
+						 $2 == "without_cluster_metadata" {
+							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+								run, scale, brin, single_key, hot_tile_fraction, $2, $3, $4, $5, $6, $7, $8, $9
+						}' "$raw" >>"$locality_tsv"
+				done
 			done
 		done
 	done
@@ -103,17 +109,18 @@ done
 awk -F'\t' '
 	BEGIN {
 		OFS = "\t"
-		print "scale", "brin_enabled", "single_key_cluster", "step",
-		      "runs", "avg_elapsed_ms", "min_elapsed_ms", "max_elapsed_ms"
+		print "scale", "brin_enabled", "single_key_cluster",
+		      "hot_tile_fraction", "step", "runs", "avg_elapsed_ms",
+		      "min_elapsed_ms", "max_elapsed_ms"
 	}
 	NR > 1 {
-		key = $2 OFS $3 OFS $4 OFS $5
-		sum[key] += $6
+		key = $2 OFS $3 OFS $4 OFS $5 OFS $6
+		sum[key] += $7
 		count[key]++
-		if (!(key in min) || $6 < min[key])
-			min[key] = $6
-		if (!(key in max) || $6 > max[key])
-			max[key] = $6
+		if (!(key in min) || $7 < min[key])
+			min[key] = $7
+		if (!(key in max) || $7 > max[key])
+			max[key] = $7
 	}
 	END {
 		for (key in count)
@@ -123,22 +130,23 @@ awk -F'\t' '
 ' "$timings_tsv" >"$timing_summary_tsv"
 {
 	head -n 1 "$timing_summary_tsv"
-	tail -n +2 "$timing_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4
+	tail -n +2 "$timing_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4V -k5,5
 } >"$timing_summary_tsv.tmp"
 mv "$timing_summary_tsv.tmp" "$timing_summary_tsv"
 
 awk -F'\t' '
 	BEGIN {
 		OFS = "\t"
-		print "scale", "brin_enabled", "single_key_cluster", "variant",
-		      "diff_kind", "runs", "avg_pct_inside_base_range",
-		      "avg_block_drift", "avg_p95_block_drift"
+		print "scale", "brin_enabled", "single_key_cluster",
+		      "hot_tile_fraction", "variant", "diff_kind", "runs",
+		      "avg_pct_inside_base_range", "avg_block_drift",
+		      "avg_p95_block_drift"
 	}
 	NR > 1 {
-		key = $2 OFS $3 OFS $4 OFS $5 OFS $6
-		pct[key] += $9
-		avg[key] += $10
-		p95[key] += $11
+		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7
+		pct[key] += $10
+		avg[key] += $11
+		p95[key] += $12
 		count[key]++
 	}
 	END {
@@ -150,7 +158,7 @@ awk -F'\t' '
 ' "$locality_tsv" >"$locality_summary_tsv"
 {
 	head -n 1 "$locality_summary_tsv"
-	tail -n +2 "$locality_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4 -k5,5
+	tail -n +2 "$locality_summary_tsv" | sort -t '	' -k1,1V -k2,2 -k3,3 -k4,4V -k5,5 -k6,6
 } >"$locality_summary_tsv.tmp"
 mv "$locality_summary_tsv.tmp" "$locality_summary_tsv"
 

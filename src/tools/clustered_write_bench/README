@@ -25,6 +25,11 @@ Set `SINGLE_KEY_VALUES="false true"` to run both clustered index shapes:
 placement for new object ids, while `true` uses a single-column `(tile_id)` key
 closer to the experimental osm2pgsql generated-geohash index.
 
+Set `HOT_TILE_FRACTION_VALUES="0 0.9"` to stress duplicate-key diffs.  A value
+of `0.9` sends 90% of inserted diff rows to tile `1`, which exercises the case
+where the first equal-key pages are already full and later inserts must advance
+to newer nearby heap pages.
+
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 `locality.tsv`, `timing_summary.tsv`, and `locality_summary.tsv`.  This is the
@@ -126,6 +131,8 @@ Important output columns:
   leave the locality metrics unchanged until a BRIN/range path is implemented.
 * `single_key_cluster`: whether the remembered clustered btree index was on
   just the tile key instead of `(tile_id, osm_id)`.
+* `hot_tile_fraction`: fraction of inserted diff rows forced onto one tile key
+  to stress duplicate-key placement over already-full equal-key pages.
 * `variant`: either the clustered-write path or the in-script control without
   remembered clustered-index metadata.
 * `step` and `elapsed_ms`: structured timing rows for the diff insert/update
