@@ -25,6 +25,11 @@
 \set hot_tile_fraction 0
 \endif
 
+\if :{?hot_tile_count}
+\else
+\set hot_tile_count 1
+\endif
+
 \if :{?heap_fillfactor}
 \else
 \set heap_fillfactor 90
@@ -61,6 +66,7 @@ select (200000 * :scale)::int as base_rows,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
+       greatest(1, least((4096 * :scale)::int, (:hot_tile_count)::int)) as hot_tile_count,
        (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
        (:'copy_diff_from_file')::boolean as copy_diff_from_file;
 
@@ -177,6 +183,7 @@ select (200000 * :scale)::int as base_rows,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
+       greatest(1, least((4096 * :scale)::int, (:hot_tile_count)::int)) as hot_tile_count,
        (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
        (:'copy_diff_from_file')::boolean as copy_diff_from_file;
 
@@ -208,7 +215,7 @@ create temp table clustered_write_diff_inserts as
 select s.base_rows + g as osm_id,
        (g <= (s.insert_rows * s.hot_tile_fraction)::int) as is_hot_insert,
        case
-         when g <= (s.insert_rows * s.hot_tile_fraction)::int then 1
+         when g <= (s.insert_rows * s.hot_tile_fraction)::int then ((g - 1) % s.hot_tile_count) + 1
          else (((g::bigint * 1103515245 + 12345) % s.tile_count) + 1)::int
        end as tile_id
 from clustered_write_settings as s,

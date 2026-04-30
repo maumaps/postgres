@@ -46,6 +46,11 @@ Set `HOT_TILE_FRACTION_VALUES="0 0.9"` to stress duplicate-key diffs.  A value
 of `0.9` sends 90% of inserted diff rows to tile `1`, which exercises the case
 where the first equal-key pages are already full and later inserts must advance
 to newer nearby heap pages.
+Set `HOT_TILE_COUNT_VALUES="1 8 128"` together with a non-zero hot fraction to
+spread those forced duplicate-key rows across multiple hot tile keys.  This
+keeps the original single-hot-key cliff visible while also exercising batches
+where several prefixes are hot at once, including the multi-hot cleanup path
+that is easy to miss with only tile `1`.
 When this value is greater than zero, locality output splits inserts into
 `insert_hot` for the forced duplicate-key rows and `insert_rest` for the
 remaining rows.  This keeps a hot-key cliff from being hidden by a small
@@ -76,6 +81,24 @@ matching the control tail span.  At fillfactor `50`, the clustered outside-base
 span was `692` versus control `693`.  The overflow run is therefore compact
 after it leaves the old range; the large full span means "reserve rows plus
 compact tail", not scattered tail placement.
+
+The multi-hot axis caught a COPY crash in the hot-prefix skip cleanup.  When a
+batch contained several prefixes whose per-prefix counts all exceeded
+`CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES`, the count/target caches had already
+allocated a comparison memory context before the batch chose to skip clustered
+target lookups entirely.  That skip path deleted the context immediately, and
+the common cache cleanup then tried to delete it again.  The cleanup now checks
+the pointer before deleting it.  A scale `1`, repeat `3`,
+`hot_tile_fraction=0.9`, `hot_tile_count=1 8`, COPY run now completes; clustered
+insert medians were `63.17 ms` for one hot key and `86.04 ms` for eight hot
+keys, with compressed raw output under
+`/home/kom/tmp/clustered-write-synthetic/multi-hot-cache-update-copy-fixed-20260501-033540/`.
+The pre-fix crash log is under
+`/home/kom/tmp/clustered-write-synthetic/multi-hot-cache-update-copy-20260501-033322/`.
+A `hot_tile_count=128` follow-up exercised the non-skip multi-hot overflow shape
+and completed without server errors; it measured clustered COPY insert at
+`187.79 ms` median versus `59.78 ms` control and kept the non-hot tail
+`96.85%` inside the base range.
 
 A current scale `1`, repeat `3`, single-key median run shows that the hot
 duplicate-key cost is no longer the main problem: integer fillfactor `90`
@@ -728,6 +751,8 @@ Important output columns:
   the control copy.
 * `hot_tile_fraction`: fraction of inserted diff rows forced onto one tile key
   to stress duplicate-key placement over already-full equal-key pages.
+* `hot_tile_count`: number of tile keys used for the forced duplicate-key rows
+  when `hot_tile_fraction` is non-zero.
 * `order_diff_by_cluster_key`: whether the synthetic diff insert was explicitly
   ordered by `(tile_id, osm_id)` before insertion.
 * `copy_diff_from_file`: whether the insert diff used the server-side

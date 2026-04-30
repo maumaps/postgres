@@ -3154,7 +3154,8 @@ skip_clustered_prefix_cache:
 				pfree(prefixCountSlots);
 				pfree(prefixCountCache);
 				pfree(prefixTargetCache);
-				MemoryContextDelete(prefixCacheCompareCxt);
+				if (prefixCacheCompareCxt != NULL)
+					MemoryContextDelete(prefixCacheCompareCxt);
 			}
 		}
 
