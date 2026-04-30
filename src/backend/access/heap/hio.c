@@ -201,8 +201,9 @@ ClusteredWriteRememberCandidate(Relation relation, BlockNumber nblocks,
 	}
 
 	candidates[*ncandidates] = candidate;
-	candidateFreeSpace[*ncandidates] = GetRecordedFreeSpace(relation,
-															candidate);
+	if (candidateFreeSpace != NULL)
+		candidateFreeSpace[*ncandidates] = GetRecordedFreeSpace(relation,
+																candidate);
 	(*ncandidates)++;
 
 	return true;
@@ -278,6 +279,11 @@ ClusteredWriteRememberPrefixCandidates(Relation relation,
  * no matches, shorter left-prefix probes can still find the existing key
  * group for composite indexes such as (tile_id, osm_id).
  *
+ * firstCandidateOnly is used by heap_multi_insert batch preparation, where the
+ * caller only wants a cheap preferred block before the locked page-space
+ * recheck.  If that preferred page is full, RelationGetBufferForTuple() falls
+ * back to the full bounded candidate search.
+ *
  * Do not use an unqualified clustered-index scan as an insertion hint.  For
  * GiST, expression indexes, and btree rows whose leading key is NULL, such a
  * scan is not anchored to the tuple being inserted and tends to find the same
@@ -294,13 +300,15 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 										  HeapTuple tuple,
 										  Size len,
 										  BlockNumber *targetBlocks,
-										  int maxTargetBlocks)
+										  int maxTargetBlocks,
+										  bool firstCandidateOnly)
 {
 	ScanKeyData skey[INDEX_MAX_KEYS];
 	IndexScanDesc scan;
 	ItemPointer tid;
 	BlockNumber candidates[CLUSTERED_WRITE_MAX_HEAP_BLOCKS];
 	Size		candidateFreeSpace[CLUSTERED_WRITE_MAX_HEAP_BLOCKS];
+	Size	   *candidateFreeSpacePtr;
 	BlockNumber nblocks;
 	int			nkeys;
 	int			nscankeys = 0;
@@ -309,6 +317,8 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	int			ntargets = 0;
 
 	Assert(maxTargetBlocks > 0);
+
+	candidateFreeSpacePtr = firstCandidateOnly ? NULL : candidateFreeSpace;
 
 	if (IsBootstrapProcessingMode() || indexRelation == NULL ||
 		tuple == NULL || len > MaxHeapTupleSize)
@@ -380,16 +390,28 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		 * for the backward scan, so a very large range cannot spend all of
 		 * either budget at its head.
 		 */
-		forwardCandidateLimit = ncandidates +
-			Max(1, remainingCandidates / 2);
-		forwardLimit = ntuples + Max(1, remainingTuples / 2);
+		if (firstCandidateOnly)
+		{
+			forwardCandidateLimit = ncandidates + 1;
+			forwardLimit = ntuples + 1;
+		}
+		else
+		{
+			forwardCandidateLimit = ncandidates +
+				Max(1, remainingCandidates / 2);
+			forwardLimit = ntuples + Max(1, remainingTuples / 2);
+		}
 		ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
 											   nblocks, skey, probeKeys,
 											   ForwardScanDirection,
-											   candidates, candidateFreeSpace,
+											   candidates,
+											   candidateFreeSpacePtr,
 											   &ncandidates, &ntuples,
 											   forwardLimit,
 											   forwardCandidateLimit);
+
+		if (firstCandidateOnly && ncandidates > 0)
+			break;
 
 		/*
 		 * The backward edge is only needed when the forward edge did not find
@@ -399,13 +421,14 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		 */
 		if (ntuples < CLUSTERED_WRITE_MAX_INDEX_TIDS &&
 			ncandidates < CLUSTERED_WRITE_MAX_HEAP_BLOCKS &&
+			!firstCandidateOnly &&
 			!ClusteredWriteHasFittingCandidate(candidateFreeSpace,
 											   ncandidates, len))
 			ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
 												   nblocks, skey, probeKeys,
 												   BackwardScanDirection,
 												   candidates,
-												   candidateFreeSpace,
+												   candidateFreeSpacePtr,
 												   &ncandidates, &ntuples,
 												   CLUSTERED_WRITE_MAX_INDEX_TIDS,
 												   CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
@@ -450,7 +473,7 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 			{
 				ClusteredWriteRememberCandidate(relation, nblocks, tid,
 												candidates,
-												candidateFreeSpace,
+												candidateFreeSpacePtr,
 												&ncandidates,
 												CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
 			}
@@ -479,7 +502,7 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 			{
 				ClusteredWriteRememberCandidate(relation, nblocks, tid,
 												candidates,
-												candidateFreeSpace,
+												candidateFreeSpacePtr,
 												&ncandidates,
 												CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
 			}
@@ -494,6 +517,13 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	 * preserving the normal locked-page free-space recheck in
 	 * RelationGetBufferForTuple().
 	 */
+	if (firstCandidateOnly)
+	{
+		if (ncandidates > 0)
+			targetBlocks[ntargets++] = candidates[0];
+		return ntargets;
+	}
+
 	for (int i = 0; i < ncandidates && ntargets < maxTargetBlocks; i++)
 	{
 		if (candidateFreeSpace[i] >= len)
@@ -538,7 +568,8 @@ RelationGetClusteredTargetBlocksForTuple(Relation relation, HeapTuple tuple,
 														 indexRelation,
 														 tuple, len,
 														 targetBlocks,
-														 maxTargetBlocks);
+														 maxTargetBlocks,
+														 false);
 
 	index_close(indexRelation, AccessShareLock);
 

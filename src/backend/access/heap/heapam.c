@@ -2716,7 +2716,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 																	  heaptuples[i],
 																	  heaptuples[i]->t_len,
 																	  &targetBlock,
-																	  1) > 0)
+																	  1,
+																	  true) > 0)
 							clustered[i].targetBlock = targetBlock;
 
 						if (prefixTargetCache != NULL && !prefixIsNull)
