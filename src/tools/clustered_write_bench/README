@@ -573,6 +573,20 @@ Do not repeat these paths blindly:
   `/home/kom/tmp/clustered-write-synthetic/copy-pack-same-target-20260501-024919/`
   and
   `/home/kom/tmp/clustered-write-synthetic/copy-pack-text-ff50-ordered-rerun-20260501-025142/`.
+* **Reusing `prefixCountSlots` directly for the COPY target cache:** rejected.
+  The counting pass already verifies leading-key equality and records a
+  per-tuple count-cache slot, so a prototype reused that slot for target-cache
+  lookups instead of extracting the prefix and comparing against the target
+  cache again.  That helped most generated text-key COPY medians in a focused
+  scale `1`, repeat `3` matrix (`ff90` unordered/ordered moved from
+  `324.91/257.94 ms` to `205.70/179.89 ms`, and `ff50` ordered moved from
+  `220.71 ms` to `190.23 ms`), but it regressed the `ff50` unordered text-key
+  case.  A repeat `6` recheck confirmed that corner at `483.62 ms` median
+  versus the previous `414.22 ms`, with unchanged `100%` inside-base locality.
+  The code experiment was reverted; raw gzip outputs are under
+  `/home/kom/tmp/clustered-write-synthetic/direct-prefix-target-cache-text-copy-20260501-025740/`
+  and
+  `/home/kom/tmp/clustered-write-synthetic/direct-prefix-target-cache-text-ff50-unordered-rerun-20260501-025849/`.
 * **Raising COPY's buffered byte limit to reach the tuple limit:** rejected.
   The idea was to let clustered COPY batches get closer to the existing
   `1000`-tuple cap instead of flushing around `65535` bytes, giving the
