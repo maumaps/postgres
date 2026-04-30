@@ -29,6 +29,10 @@ Set `HOT_TILE_FRACTION_VALUES="0 0.9"` to stress duplicate-key diffs.  A value
 of `0.9` sends 90% of inserted diff rows to tile `1`, which exercises the case
 where the first equal-key pages are already full and later inserts must advance
 to newer nearby heap pages.
+When this value is greater than zero, locality output splits inserts into
+`insert_hot` for the forced duplicate-key rows and `insert_rest` for the
+remaining rows.  This keeps a hot-key cliff from being hidden by a small
+well-placed non-hot tail.
 
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
@@ -135,6 +139,8 @@ Important output columns:
   to stress duplicate-key placement over already-full equal-key pages.
 * `variant`: either the clustered-write path or the in-script control without
   remembered clustered-index metadata.
+* `diff_kind`: `insert`/`update` normally, or `insert_hot`/`insert_rest` when
+  `hot_tile_fraction` is nonzero.
 * `step` and `elapsed_ms`: structured timing rows for the diff insert/update
   statements, emitted before the locality summary so runs can be compared
   without scraping `psql` timing chatter.

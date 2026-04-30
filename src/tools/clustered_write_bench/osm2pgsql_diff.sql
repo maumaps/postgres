@@ -148,6 +148,7 @@ group by tile_id;
 
 create temp table clustered_write_diff_inserts as
 select s.base_rows + g as osm_id,
+       (g <= (s.insert_rows * s.hot_tile_fraction)::int) as is_hot_insert,
        case
          when g <= (s.insert_rows * s.hot_tile_fraction)::int then 1
          else (((g::bigint * 1103515245 + 12345) % s.tile_count) + 1)::int
@@ -227,12 +228,18 @@ order by t.step;
 with measured as
 (
     select 'clustered_write'::text as variant,
-           'insert'::text as diff_kind,
+           case
+             when s.hot_tile_fraction > 0 and d.is_hot_insert then 'insert_hot'
+             when s.hot_tile_fraction > 0 then 'insert_rest'
+             else 'insert'
+           end as diff_kind,
            pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_on as o
     join clustered_write_settings as s on true
+    join clustered_write_diff_inserts as d
+      on d.osm_id = o.osm_id
     join clustered_write_base_ranges as r
       on r.variant = 'clustered_write'
      and r.tile_id = o.tile_id
@@ -256,12 +263,18 @@ with measured as
     union all
 
     select 'without_cluster_metadata'::text as variant,
-           'insert'::text as diff_kind,
+           case
+             when s.hot_tile_fraction > 0 and d.is_hot_insert then 'insert_hot'
+             when s.hot_tile_fraction > 0 then 'insert_rest'
+             else 'insert'
+           end as diff_kind,
            pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_off as o
     join clustered_write_settings as s on true
+    join clustered_write_diff_inserts as d
+      on d.osm_id = o.osm_id
     join clustered_write_base_ranges as r
       on r.variant = 'without_cluster_metadata'
      and r.tile_id = o.tile_id

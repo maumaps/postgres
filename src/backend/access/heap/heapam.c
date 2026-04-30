@@ -2581,11 +2581,13 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		use_clustered_sort = false;
 		bool		has_clustered_target = false;
 		bool		has_clustered_sort = false;
+		bool		has_skipped_clustered_target_probe = false;
 		AttrNumber	prefixCacheAttnum = InvalidAttrNumber;
 		Oid			prefixCacheCollation = InvalidOid;
 		RegProcedure prefixCacheEqProc = InvalidOid;
 		HeapTupleClusteredTargetCacheEntry *prefixTargetCache = NULL;
 		HeapTupleClusteredPrefixCountEntry *prefixCountCache = NULL;
+		int		   *prefixCountSlots = NULL;
 		MemoryContext prefixCacheCompareCxt = NULL;
 		bool		usePrefixHashCache = false;
 		int			prefixTargetCacheLimit = 0;
@@ -2653,6 +2655,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					prefixCountCache =
 						palloc0_array(HeapTupleClusteredPrefixCountEntry,
 									  prefixTargetCacheLimit);
+					prefixCountSlots = palloc_array(int, ntuples);
+					for (i = 0; i < ntuples; i++)
+						prefixCountSlots[i] = -1;
 					prefixTargetCacheMask = prefixTargetCacheLimit - 1;
 					prefixCacheCompareCxt =
 						AllocSetContextCreate(CurrentMemoryContext,
@@ -2712,6 +2717,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 							if (equal)
 							{
 								prefixCountCache[cacheSlot].ntuples++;
+								prefixCountSlots[i] = cacheSlot;
 								foundCount = true;
 								break;
 							}
@@ -2738,6 +2744,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 								prefixValue;
 							prefixCountCache[cacheSlot].ntuples = 1;
 							prefixCountCache[cacheSlot].occupied = true;
+							prefixCountSlots[i] = cacheSlot;
 						}
 					}
 				}
@@ -2760,15 +2767,27 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 					if (prefixTargetCache != NULL)
 					{
-						prefixValue =
-							heap_getattr(heaptuples[i],
-										 prefixCacheAttnum,
-										 relation->rd_att,
-										 &prefixIsNull);
-						if (!prefixIsNull)
+						if (prefixCountSlots != NULL &&
+							prefixCountSlots[i] >= 0)
+						{
+							int			countSlot = prefixCountSlots[i];
+
+							skipClusteredTargetProbe =
+								prefixCountCache[countSlot].ntuples >
+								CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES;
+						}
+
+						if (!skipClusteredTargetProbe)
+						{
+							prefixValue =
+								heap_getattr(heaptuples[i],
+											 prefixCacheAttnum,
+											 relation->rd_att,
+											 &prefixIsNull);
+						}
+						if (!prefixIsNull && !skipClusteredTargetProbe)
 						{
 							int			ncacheEntries;
-							int			ncountEntries;
 
 							if (usePrefixHashCache)
 							{
@@ -2781,52 +2800,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 								ncacheEntries =
 									prefixTargetCache[prefixCacheSlot].occupied ?
 									1 : 0;
-								ncountEntries =
-									prefixCountCache[prefixCacheSlot].occupied ?
-									1 : 0;
 							}
 							else
-							{
 								ncacheEntries = prefixTargetCacheSize;
-								ncountEntries = prefixCountCacheSize;
-							}
-
-							if (prefixCountCache != NULL)
-							{
-								for (int j = 0; j < ncountEntries; j++)
-								{
-									bool		equal;
-									MemoryContext oldcontext;
-									int			cacheSlot;
-
-									cacheSlot = usePrefixHashCache ?
-										prefixCacheSlot : j;
-
-									if (!prefixCountCache[cacheSlot].occupied)
-										continue;
-
-									oldcontext =
-										MemoryContextSwitchTo(prefixCacheCompareCxt);
-									equal =
-										DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
-																		  prefixCacheCollation,
-																		  prefixCountCache[cacheSlot].prefixValue,
-																		  prefixValue));
-									MemoryContextSwitchTo(oldcontext);
-									MemoryContextReset(prefixCacheCompareCxt);
-
-									if (equal)
-									{
-										skipClusteredTargetProbe =
-											prefixCountCache[cacheSlot].ntuples >
-											CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES;
-										break;
-									}
-								}
-							}
-
-							if (skipClusteredTargetProbe)
-								ncacheEntries = 0;
 
 							for (int j = 0; j < ncacheEntries; j++)
 							{
@@ -2857,6 +2833,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 							}
 						}
 					}
+					if (skipClusteredTargetProbe)
+						has_skipped_clustered_target_probe = true;
 
 					if (!foundCachedTarget && !skipClusteredTargetProbe)
 					{
@@ -2902,15 +2880,17 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 													  clustered, ntuples,
 													  &sortContext) > 0;
 
-			if (has_clustered_target || has_clustered_sort)
+			if (has_clustered_target || has_clustered_sort ||
+				has_skipped_clustered_target_probe)
 			{
 				heaptuple_slot_indexes = palloc_array(int, ntuples);
 				heaptuple_clustered_target_blocks =
 					palloc_array(BlockNumber, ntuples);
-				qsort_arg(clustered, ntuples,
-						  sizeof(HeapTupleClusteredWriteItem),
-						  heap_clustered_write_item_cmp,
-						  has_clustered_sort ? &sortContext : NULL);
+				if (has_clustered_target || has_clustered_sort)
+					qsort_arg(clustered, ntuples,
+							  sizeof(HeapTupleClusteredWriteItem),
+							  heap_clustered_write_item_cmp,
+							  has_clustered_sort ? &sortContext : NULL);
 				for (i = 0; i < ntuples; i++)
 				{
 					heaptuples[i] = clustered[i].tuple;
@@ -2927,6 +2907,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			pfree(clustered);
 			if (prefixTargetCache != NULL)
 			{
+				pfree(prefixCountSlots);
 				pfree(prefixCountCache);
 				pfree(prefixTargetCache);
 				MemoryContextDelete(prefixCacheCompareCxt);
