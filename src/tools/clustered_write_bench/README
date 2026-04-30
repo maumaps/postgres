@@ -393,6 +393,18 @@ Do not repeat these paths blindly:
   and a relcache-invalidation stress (`30` insert/invalidation cycles) dropped
   from `1082680` total / `787256` used bytes after warmup to `1048576` total /
   `755272` used bytes after stress instead of growing.
+* **Single-row target-block cache for non-exhausted prefixes:** rejected.  This
+  tried to remember ordinary successful leading-prefix target pages for
+  `INSERT ... SELECT`, not just exhausted-prefix overflow pages.  The idea was
+  to avoid repeated btree target probes in the non-hot synthetic matrix, but it
+  added enough extra per-prefix metadata work that scale `1`, hot `0` got
+  slower without improving locality.  Representative clustered insert timings
+  regressed from the inline-overflow-cache sweep's `313.52 ms` to `348.92 ms`
+  for composite integer fillfactor `90`, from `417.75 ms` to `465.84 ms` for
+  composite integer fillfactor `50`, from `284.92 ms` to `377.66 ms` for
+  composite text fillfactor `90`, and from `317.57 ms` to `398.11 ms` for
+  single text fillfactor `90`.  The raw focused run is under
+  `/home/kom/tmp/clustered-write-synthetic/single-row-target-cache-focused-20260430-230337/`.
 
 The useful lesson from the rejected hot-prefix work is that duplicate-key
 batches need either a genuinely local page-selection policy for the repeated
