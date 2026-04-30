@@ -97,8 +97,14 @@ where it is a better fit.
 
 Important output columns:
 
+* `brin_enabled`: whether the optional BRIN index was present for this run.
+  Current placement does not consume BRIN directly, so this should normally
+  leave the locality metrics unchanged until a BRIN/range path is implemented.
 * `variant`: either the clustered-write path or the in-script control without
   remembered clustered-index metadata.
+* `step` and `elapsed_ms`: structured timing rows for the diff insert/update
+  statements, emitted before the locality summary so runs can be compared
+  without scraping `psql` timing chatter.
 * `pct_inside_base_range`: higher is better; percent of diff tuples still inside
   the tile's original clustered heap block range.
 * `avg_block_drift`, `p95_block_drift`, `max_block_drift`: lower is better;
