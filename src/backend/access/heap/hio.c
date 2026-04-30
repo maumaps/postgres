@@ -46,6 +46,9 @@ static bool ClusteredWriteRememberCandidate(Relation relation,
 											BlockNumber *candidates,
 											Size *candidateFreeSpace,
 											int *ncandidates);
+static bool ClusteredWriteHasFittingCandidate(Size *candidateFreeSpace,
+											  int ncandidates,
+											  Size len);
 static void ClusteredWriteRememberPrefixCandidates(Relation relation,
 												   Relation indexRelation,
 												   BlockNumber nblocks,
@@ -55,7 +58,8 @@ static void ClusteredWriteRememberPrefixCandidates(Relation relation,
 												   BlockNumber *candidates,
 												   Size *candidateFreeSpace,
 												   int *ncandidates,
-												   int *ntuples);
+												   int *ntuples,
+												   int tupleLimit);
 static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
 													HeapTuple tuple,
 													Size len,
@@ -195,6 +199,19 @@ ClusteredWriteRememberCandidate(Relation relation, BlockNumber nblocks,
 	return true;
 }
 
+static bool
+ClusteredWriteHasFittingCandidate(Size *candidateFreeSpace, int ncandidates,
+								  Size len)
+{
+	for (int i = 0; i < ncandidates; i++)
+	{
+		if (candidateFreeSpace[i] >= len)
+			return true;
+	}
+
+	return false;
+}
+
 /*
  * Remember candidate pages from one bounded scan of a btree equality-prefix
  * range.  Callers run this in both directions so large duplicate-key or
@@ -211,12 +228,14 @@ ClusteredWriteRememberPrefixCandidates(Relation relation,
 									   BlockNumber *candidates,
 									   Size *candidateFreeSpace,
 									   int *ncandidates,
-									   int *ntuples)
+									   int *ntuples,
+									   int tupleLimit)
 {
 	IndexScanDesc scan;
 	ItemPointer tid;
 
 	Assert(nscankeys > 0);
+	Assert(tupleLimit > 0);
 
 	scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
 						   nscankeys, 0, 0);
@@ -224,8 +243,9 @@ ClusteredWriteRememberPrefixCandidates(Relation relation,
 
 	while ((tid = index_getnext_tid(scan, direction)) != NULL)
 	{
-		if (++(*ntuples) > CLUSTERED_WRITE_MAX_INDEX_TIDS)
+		if (*ntuples >= tupleLimit)
 			break;
+		(*ntuples)++;
 
 		ClusteredWriteRememberCandidate(relation, nblocks, tid,
 										candidates, candidateFreeSpace,
@@ -326,6 +346,9 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 
 	for (int probeKeys = nscankeys; probeKeys > 0; probeKeys--)
 	{
+		int			remainingTuples;
+		int			forwardLimit;
+
 		/*
 		 * Plain btree keys can use equality scan keys and retry shorter left
 		 * prefixes.  Probe each matching range from both ends, so very large
@@ -333,20 +356,39 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		 * heap pages.  Unqualified scans are deliberately skipped because
 		 * they are not anchored to the tuple being inserted.
 		 */
+		remainingTuples = CLUSTERED_WRITE_MAX_INDEX_TIDS - ntuples;
+		if (remainingTuples <= 0)
+			break;
+
+		/*
+		 * Reserve roughly half the remaining TID budget for the backward scan
+		 * so a very large range cannot spend the whole budget at its head.
+		 */
+		forwardLimit = ntuples + Max(1, remainingTuples / 2);
 		ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
 											   nblocks, skey, probeKeys,
 											   ForwardScanDirection,
 											   candidates, candidateFreeSpace,
-											   &ncandidates, &ntuples);
+											   &ncandidates, &ntuples,
+											   forwardLimit);
 
+		/*
+		 * The backward edge is only needed when the forward edge did not find
+		 * any candidate page that the FSM already considers large enough.
+		 * This avoids doubling index probes for the common case while still
+		 * helping large duplicate-key ranges whose first pages are full.
+		 */
 		if (ntuples < CLUSTERED_WRITE_MAX_INDEX_TIDS &&
-			ncandidates < CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+			ncandidates < CLUSTERED_WRITE_MAX_HEAP_BLOCKS &&
+			!ClusteredWriteHasFittingCandidate(candidateFreeSpace,
+											   ncandidates, len))
 			ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
 												   nblocks, skey, probeKeys,
 												   BackwardScanDirection,
 												   candidates,
 												   candidateFreeSpace,
-												   &ncandidates, &ntuples);
+												   &ncandidates, &ntuples,
+												   CLUSTERED_WRITE_MAX_INDEX_TIDS);
 
 		if (ntuples >= CLUSTERED_WRITE_MAX_INDEX_TIDS ||
 			ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
