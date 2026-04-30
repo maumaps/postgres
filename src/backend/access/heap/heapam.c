@@ -182,7 +182,11 @@ heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
 	if (left->targetBlock > right->targetBlock)
 		return 1;
 
-	return left->inputIndex - right->inputIndex;
+	if (left->inputIndex < right->inputIndex)
+		return -1;
+	if (left->inputIndex > right->inputIndex)
+		return 1;
+	return 0;
 }
 
 static bool
