@@ -15,6 +15,11 @@
 \set single_key_cluster false
 \endif
 
+\if :{?text_cluster_key}
+\else
+\set text_cluster_key false
+\endif
+
 \if :{?hot_tile_fraction}
 \else
 \set hot_tile_fraction 0
@@ -33,17 +38,19 @@ select (200000 * :scale)::int as base_rows,
        (4096 * :scale)::int as tile_count,
        (:'use_brin')::boolean as brin_enabled,
        (:'single_key_cluster')::boolean as single_key_cluster,
+       (:'text_cluster_key')::boolean as text_cluster_key,
        (:hot_tile_fraction)::numeric as hot_tile_fraction;
 
 create unlogged table clustered_write_osm_diff_on
 (
     osm_id bigint primary key,
     tile_id int not null,
+    cluster_key text generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
     version int not null,
     payload text not null
 ) with (fillfactor = 90);
 
-insert into clustered_write_osm_diff_on
+insert into clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
 select g,
        ((g - 1) % s.tile_count) + 1,
        1,
@@ -51,17 +58,27 @@ select g,
 from clustered_write_settings as s,
      generate_series(1, s.base_rows) as g;
 
-\if :single_key_cluster
+\if :text_cluster_key
+create index clustered_write_osm_diff_tile_idx
+    on clustered_write_osm_diff_on (cluster_key);
+\else
+    \if :single_key_cluster
 create index clustered_write_osm_diff_tile_idx
     on clustered_write_osm_diff_on (tile_id);
-\else
+    \else
 create index clustered_write_osm_diff_tile_idx
     on clustered_write_osm_diff_on (tile_id, osm_id);
+    \endif
 \endif
 
 \if :use_brin
+\if :text_cluster_key
+create index clustered_write_osm_diff_tile_brin_idx
+    on clustered_write_osm_diff_on using brin (cluster_key) with (pages_per_range = 32);
+\else
 create index clustered_write_osm_diff_tile_brin_idx
     on clustered_write_osm_diff_on using brin (tile_id) with (pages_per_range = 32);
+\endif
 \endif
 
 cluster clustered_write_osm_diff_on using clustered_write_osm_diff_tile_idx;
@@ -71,25 +88,39 @@ create unlogged table clustered_write_osm_diff_off
 (
     osm_id bigint primary key,
     tile_id int not null,
+    cluster_key text generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
     version int not null,
     payload text not null
 ) with (fillfactor = 90);
 
-insert into clustered_write_osm_diff_off
-select *
+insert into clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
+select osm_id,
+       tile_id,
+       version,
+       payload
 from clustered_write_osm_diff_on;
 
-\if :single_key_cluster
+\if :text_cluster_key
+create index clustered_write_osm_diff_off_tile_idx
+    on clustered_write_osm_diff_off (cluster_key);
+\else
+    \if :single_key_cluster
 create index clustered_write_osm_diff_off_tile_idx
     on clustered_write_osm_diff_off (tile_id);
-\else
+    \else
 create index clustered_write_osm_diff_off_tile_idx
     on clustered_write_osm_diff_off (tile_id, osm_id);
+    \endif
 \endif
 
 \if :use_brin
+\if :text_cluster_key
+create index clustered_write_osm_diff_off_tile_brin_idx
+    on clustered_write_osm_diff_off using brin (cluster_key) with (pages_per_range = 32);
+\else
 create index clustered_write_osm_diff_off_tile_brin_idx
     on clustered_write_osm_diff_off using brin (tile_id) with (pages_per_range = 32);
+\endif
 \endif
 
 cluster clustered_write_osm_diff_off using clustered_write_osm_diff_off_tile_idx;
@@ -120,6 +151,7 @@ select (200000 * :scale)::int as base_rows,
        (4096 * :scale)::int as tile_count,
        (:'use_brin')::boolean as brin_enabled,
        (:'single_key_cluster')::boolean as single_key_cluster,
+       (:'text_cluster_key')::boolean as text_cluster_key,
        (:hot_tile_fraction)::numeric as hot_tile_fraction;
 
 create temp table clustered_write_step_timings
@@ -159,7 +191,7 @@ from clustered_write_settings as s,
 insert into clustered_write_step_timings
 values ('clustered_write_insert', clock_timestamp(), null);
 
-insert into clustered_write_osm_diff_on
+insert into clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
 select d.osm_id,
        d.tile_id,
        1,
@@ -173,7 +205,7 @@ where step = 'clustered_write_insert';
 insert into clustered_write_step_timings
 values ('without_cluster_metadata_insert', clock_timestamp(), null);
 
-insert into clustered_write_osm_diff_off
+insert into clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
 select d.osm_id,
        d.tile_id,
        1,
@@ -219,6 +251,7 @@ analyze clustered_write_osm_diff_on;
 analyze clustered_write_osm_diff_off;
 
 select s.brin_enabled,
+       s.text_cluster_key,
        t.step,
        round((extract(epoch from t.finished_at - t.started_at) * 1000)::numeric, 2) as elapsed_ms
 from clustered_write_step_timings as t
@@ -308,6 +341,7 @@ drift as
     from measured
 )
 select s.brin_enabled,
+       s.text_cluster_key,
        variant,
        diff_kind,
        count(*) as rows_measured,
@@ -318,5 +352,5 @@ select s.brin_enabled,
        max(block_drift) as max_block_drift
 from drift
 join clustered_write_settings as s on true
-group by s.brin_enabled, variant, diff_kind
-order by s.brin_enabled, variant, diff_kind;
+group by s.brin_enabled, s.text_cluster_key, variant, diff_kind
+order by s.brin_enabled, s.text_cluster_key, variant, diff_kind;
