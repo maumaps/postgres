@@ -58,6 +58,7 @@
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/sortsupport.h"
 #include "utils/spccache.h"
@@ -77,6 +78,12 @@ typedef struct HeapTupleClusteredSortContext
 {
 	int			nkeys;
 	SortSupportData sortKeys[INDEX_MAX_KEYS];
+
+	/* GiST compressed keys must survive until qsort finishes. */
+	MemoryContext sortCxt;
+
+	/* Comparator support functions should not leak into the caller context. */
+	MemoryContext compareCxt;
 } HeapTupleClusteredSortContext;
 
 
@@ -156,12 +163,17 @@ heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
 		for (int i = 0; i < context->nkeys; i++)
 		{
 			int			compare;
+			MemoryContext oldcontext;
 
+			oldcontext = MemoryContextSwitchTo(context->compareCxt);
 			compare = ApplySortComparator(left->clusterValues[i],
 										  left->clusterIsNull[i],
 										  right->clusterValues[i],
 										  right->clusterIsNull[i],
 										  &context->sortKeys[i]);
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextReset(context->compareCxt);
+
 			if (compare != 0)
 				return compare;
 		}
@@ -241,14 +253,24 @@ heap_prepare_clustered_write_sort(Relation relation,
 								  HeapTupleClusteredSortContext *context)
 {
 	GISTSTATE  *giststate = NULL;
+	MemoryContext oldcontext;
 	int			nkeys;
 
 	context->nkeys = 0;
+	context->sortCxt = NULL;
+	context->compareCxt = NULL;
 
 	if (!heap_clustered_write_index_can_sort(relation, indexRelation))
 		return 0;
 
 	nkeys = indexRelation->rd_index->indnkeyatts;
+	context->sortCxt = AllocSetContextCreate(CurrentMemoryContext,
+											 "heap clustered write sort",
+											 ALLOCSET_DEFAULT_SIZES);
+	context->compareCxt = AllocSetContextCreate(context->sortCxt,
+												"heap clustered write compare",
+												ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(context->sortCxt);
 
 	for (int i = 0; i < nkeys; i++)
 	{
@@ -265,6 +287,7 @@ heap_prepare_clustered_write_sort(Relation relation,
 	}
 
 	giststate = initGISTstate(indexRelation);
+	giststate->tempCxt = context->sortCxt;
 
 	for (int i = 0; i < ntuples; i++)
 	{
@@ -287,6 +310,7 @@ heap_prepare_clustered_write_sort(Relation relation,
 
 	context->nkeys = nkeys;
 	freeGISTstate(giststate);
+	MemoryContextSwitchTo(oldcontext);
 
 	return nkeys;
 }
@@ -2509,7 +2533,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	if ((options & HEAP_INSERT_SKIP_FSM) == 0 && ntuples > 1)
 	{
 		HeapTupleClusteredWriteItem *clustered;
-		HeapTupleClusteredSortContext sortContext;
+		HeapTupleClusteredSortContext sortContext = {0};
 		Oid			clusteredIndexOid = InvalidOid;
 		Relation	clusteredIndexRelation = NULL;
 		bool		use_clustered_target_probe = false;
@@ -2575,7 +2599,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					heaptuples[i] = clustered[i].tuple;
 					heaptuple_slot_indexes[i] = clustered[i].inputIndex;
 				}
+				if (sortContext.sortCxt != NULL)
+					MemoryContextDelete(sortContext.sortCxt);
 			}
+			else if (sortContext.sortCxt != NULL)
+				MemoryContextDelete(sortContext.sortCxt);
 
 			pfree(clustered);
 		}

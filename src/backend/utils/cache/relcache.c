@@ -4819,9 +4819,11 @@ RelationGetFKeyList(Relation relation)
  * indexes, and syscache lookup could cause SI messages to be processed!
  *
  * In exactly the same way, we update rd_pkindex, which is the OID of the
- * relation's primary key index if any, else InvalidOid; and rd_replidindex,
+ * relation's primary key index if any, else InvalidOid; rd_replidindex,
  * which is the pg_class OID of an index to be used as the relation's
- * replication identity index, or InvalidOid if there is no such index.
+ * replication identity index, or InvalidOid if there is no such index; and
+ * rd_clusteredindex, which is the OID of the relation's clustered index if
+ * any, else InvalidOid.
  */
 List *
 RelationGetIndexList(Relation relation)
