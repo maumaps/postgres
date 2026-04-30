@@ -154,6 +154,23 @@ clustered insert medians ranged from `228.15 ms` to `520.25 ms`; generated
 text-key COPY ranged from `183.49 ms` to `546.30 ms`, with unchanged
 `83.97-100%` insert locality.  The raw gzip run is under
 `/home/kom/tmp/clustered-write-synthetic/current-insert-copy-after-lazy-single-row-20260501-023819/`.
+The next fix keeps same-target COPY runs packed even when a full clustered
+neighbour redirects the insertion to the relation tail.  The previous boundary
+guard compared later tuples against the actual selected buffer; when the first
+tuple in a group fell back from its remembered clustered page to the tail, the
+rest of the same-target group stopped packing with it and paid the multi-insert
+page-selection cost row by row.  A scale `1`, repeat `3`, copy-only matrix kept
+the same locality and improved most clustered COPY medians: integer `ff50`
+unordered/ordered moved from `520.25/291.35 ms` to `376.68/163.09 ms`, text
+`ff90` unordered/ordered moved from `546.30/488.15 ms` to
+`324.91/257.94 ms`, and text `ff50` unordered moved from `530.62 ms` to
+`414.22 ms`.  Integer `ff90` improved modestly (`228.15/259.51 ms` to
+`212.44/220.67 ms`).  The only initially suspicious case, text `ff50` ordered,
+was rechecked with repeat `6` and had a `190.97 ms` median while preserving
+`100%` inside-base locality.  Raw gzip outputs are under
+`/home/kom/tmp/clustered-write-synthetic/copy-pack-same-target-20260501-024919/`
+and
+`/home/kom/tmp/clustered-write-synthetic/copy-pack-text-ff50-ordered-rerun-20260501-025142/`.
 unordered integer COPY remained faster than INSERT (`ff90` median `311.79 ms`
 versus `522.57 ms`, `ff50` `387.20 ms` versus `908.74 ms` in that run), while
 ordered `ff90` COPY regressed (`483.56 ms` versus `296.00 ms`).  A repeat `2`
@@ -538,6 +555,24 @@ Do not repeat these paths blindly:
   `/home/kom/tmp/clustered-write-synthetic/lazy-single-row-first-candidate-focused-20260501-023105/`
   and
   `/home/kom/tmp/clustered-write-synthetic/lazy-single-row-first-candidate-hot-20260501-023331/`.
+* **Same-target COPY packing after tail fallback:** fixed.  The first COPY
+  boundary guard preserved locality by stopping a multi-insert page when the
+  next tuple targeted a different clustered neighbourhood, but it compared
+  later tuples with the actual selected buffer.  When the remembered clustered
+  page was full and `RelationGetBufferForTuple()` redirected the run to the
+  relation tail, tuples that shared the same remembered target stopped packing
+  together.  The fix compares the next tuple with the remembered clustered
+  target instead, so same-target groups still use normal multi-insert packing
+  on the fallback page.  A scale `1`, repeat `3`, copy-only matrix preserved
+  locality and improved most clustered COPY medians, including integer `ff50`
+  unordered/ordered (`520.25/291.35 ms` to `376.68/163.09 ms`) and text `ff90`
+  unordered/ordered (`546.30/488.15 ms` to `324.91/257.94 ms`).  The suspected
+  text `ff50` ordered regression was re-run with repeat `6` and held a
+  `190.97 ms` median with `100%` inside-base locality.  Raw gzip output is
+  under
+  `/home/kom/tmp/clustered-write-synthetic/copy-pack-same-target-20260501-024919/`
+  and
+  `/home/kom/tmp/clustered-write-synthetic/copy-pack-text-ff50-ordered-rerun-20260501-025142/`.
 * **Raising COPY's buffered byte limit to reach the tuple limit:** rejected.
   The idea was to let clustered COPY batches get closer to the existing
   `1000`-tuple cap instead of flushing around `65535` bytes, giving the

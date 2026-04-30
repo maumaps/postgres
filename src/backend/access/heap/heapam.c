@@ -3283,13 +3283,18 @@ skip_clustered_prefix_cache:
 			 */
 			if (heaptuple_clustered_target_blocks != NULL)
 			{
-				BlockNumber currentBlock = BufferGetBlockNumber(buffer);
 				BlockNumber nextTargetBlock =
 					heaptuple_clustered_target_blocks[ndone + nthispage];
 
 				if (BlockNumberIsValid(clustered_target_block))
 				{
-					if (nextTargetBlock != currentBlock)
+					/*
+					 * Compare against the remembered clustered target, not
+					 * the actual buffer.  A full clustered neighbour may
+					 * redirect the run to the tail, where same-target tuples
+					 * should still be packed together.
+					 */
+					if (nextTargetBlock != clustered_target_block)
 						break;
 				}
 				else if (BlockNumberIsValid(nextTargetBlock))
