@@ -954,6 +954,12 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
  *	BULKWRITE buffer selection strategy object to the buffer manager.
  *	Passing NULL for bistate selects the default behavior.
  *
+ *	preferredBlock can pass a clustered-index target that the caller already
+ *	computed while preparing the batch.  RelationGetBufferForTuple still owns
+ *	the page-space validation and fallback path, so a stale or full target
+ *	page is harmless.  If the preferred page is full and the caller also
+ *	passed tuple, we lazily probe the index for the remaining candidates.
+ *
  *	We don't fill existing pages further than the fillfactor, except for large
  *	tuples in nearly-empty pages.  This is OK since this routine is not
  *	consulted when updating a tuple and keeping it on the same page, which is
@@ -965,6 +971,7 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 Buffer
 RelationGetBufferForTuple(Relation relation, Size len,
 						  HeapTuple tuple,
+						  BlockNumber preferredBlock,
 						  Buffer otherBuffer, uint32 options,
 						  BulkInsertState bistate,
 						  Buffer *vmbuffer, Buffer *vmbuffer_other,
@@ -983,6 +990,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	int			nclusteredTargetBlocks = 0,
 				clusteredTargetIndex = 0;
 	bool		usingClusteredTarget = false;
+	bool		usingPreferredBlock = false;
 	bool		unlockedTargetBuffer;
 	bool		recheckVmPins;
 
@@ -1049,12 +1057,22 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	 */
 	if (use_fsm && otherBuffer == InvalidBuffer)
 	{
-		nclusteredTargetBlocks =
-			RelationGetClusteredTargetBlocksForTuple(relation, tuple, len,
-													 clusteredTargetBlocks,
-													 lengthof(clusteredTargetBlocks));
-		if (nclusteredTargetBlocks > 0)
-			targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+		if (BlockNumberIsValid(preferredBlock))
+		{
+			clusteredTargetBlocks[0] = preferredBlock;
+			nclusteredTargetBlocks = 1;
+			targetBlock = preferredBlock;
+			usingPreferredBlock = true;
+		}
+		else if (tuple != NULL)
+		{
+			nclusteredTargetBlocks =
+				RelationGetClusteredTargetBlocksForTuple(relation, tuple, len,
+														 clusteredTargetBlocks,
+														 lengthof(clusteredTargetBlocks));
+			if (nclusteredTargetBlocks > 0)
+				targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+		}
 		usingClusteredTarget = (targetBlock != InvalidBlockNumber);
 	}
 
@@ -1217,6 +1235,8 @@ loop:
 
 		if (usingClusteredTarget)
 		{
+			BlockNumber attemptedBlock = targetBlock;
+
 			if (use_fsm)
 				RecordPageWithFreeSpace(relation, targetBlock, pageFreeSpace);
 
@@ -1225,6 +1245,26 @@ loop:
 			{
 				targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
 				continue;
+			}
+
+			if (usingPreferredBlock && tuple != NULL)
+			{
+				usingPreferredBlock = false;
+				nclusteredTargetBlocks =
+					RelationGetClusteredTargetBlocksForTuple(relation, tuple,
+															 len,
+															 clusteredTargetBlocks,
+															 lengthof(clusteredTargetBlocks));
+				for (clusteredTargetIndex = 0;
+					 clusteredTargetIndex < nclusteredTargetBlocks;
+					 clusteredTargetIndex++)
+				{
+					targetBlock = clusteredTargetBlocks[clusteredTargetIndex];
+					if (targetBlock != attemptedBlock)
+						break;
+				}
+				if (clusteredTargetIndex < nclusteredTargetBlocks)
+					continue;
 			}
 
 			usingClusteredTarget = false;

@@ -63,6 +63,7 @@ extern int RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 													 int maxTargetBlocks);
 extern Buffer RelationGetBufferForTuple(Relation relation, Size len,
 										HeapTuple tuple,
+										BlockNumber preferredBlock,
 										Buffer otherBuffer, uint32 options,
 										BulkInsertStateData *bistate,
 										Buffer *vmbuffer, Buffer *vmbuffer_other,

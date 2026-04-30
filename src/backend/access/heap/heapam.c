@@ -2239,6 +2239,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 */
 	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
 									   heaptup,
+									   InvalidBlockNumber,
 									   InvalidBuffer, options, bistate,
 									   &vmbuffer, NULL,
 									   0);
@@ -2494,6 +2495,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	TransactionId xid = GetCurrentTransactionId();
 	HeapTuple  *heaptuples;
 	int		   *heaptuple_slot_indexes = NULL;
+	BlockNumber *heaptuple_clustered_target_blocks = NULL;
 	int			i;
 	int			ndone;
 	PGAlignedBlock scratch;
@@ -2595,6 +2597,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (has_clustered_target || has_clustered_sort)
 			{
 				heaptuple_slot_indexes = palloc_array(int, ntuples);
+				heaptuple_clustered_target_blocks =
+					palloc_array(BlockNumber, ntuples);
 				qsort_arg(clustered, ntuples,
 						  sizeof(HeapTupleClusteredWriteItem),
 						  heap_clustered_write_item_cmp,
@@ -2603,6 +2607,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				{
 					heaptuples[i] = clustered[i].tuple;
 					heaptuple_slot_indexes[i] = clustered[i].inputIndex;
+					heaptuple_clustered_target_blocks[i] =
+						clustered[i].targetBlock;
 				}
 				if (sortContext.sortCxt != NULL)
 					MemoryContextDelete(sortContext.sortCxt);
@@ -2646,6 +2652,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	while (ndone < ntuples)
 	{
 		Buffer		buffer;
+		HeapTuple	clustered_target_tuple = heaptuples[ndone];
+		BlockNumber clustered_target_block = InvalidBlockNumber;
 		bool		all_visible_cleared = false;
 		bool		all_frozen_set = false;
 		int			nthispage;
@@ -2678,8 +2686,17 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 * Also pin visibility map page if COPY FREEZE inserts tuples into an
 		 * empty page. See all_frozen_set below.
 		 */
+		if (heaptuple_clustered_target_blocks != NULL)
+		{
+			clustered_target_block =
+				heaptuple_clustered_target_blocks[ndone];
+			if (clustered_target_block == InvalidBlockNumber)
+				clustered_target_tuple = NULL;
+		}
+
 		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
-										   heaptuples[ndone],
+										   clustered_target_tuple,
+										   clustered_target_block,
 										   InvalidBuffer, options, bistate,
 										   &vmbuffer, NULL,
 										   npages - npages_used);
@@ -2944,6 +2961,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		for (i = 0; i < ntuples; i++)
 			slots[heaptuple_slot_indexes[i]]->tts_tid = heaptuples[i]->t_self;
 		pfree(heaptuple_slot_indexes);
+		pfree(heaptuple_clustered_target_blocks);
 	}
 	else
 	{
@@ -4215,6 +4233,7 @@ l2:
 				/* It doesn't fit, must use RelationGetBufferForTuple. */
 				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
 												   NULL,
+												   InvalidBlockNumber,
 												   buffer, 0, NULL,
 												   &vmbuffer_new, &vmbuffer,
 												   0);
