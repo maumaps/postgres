@@ -204,6 +204,7 @@ heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
 static bool
 heap_clustered_write_index_can_sort(Relation relation, Relation indexRelation)
 {
+	int			natts;
 	int			nkeys;
 
 	if (IsBootstrapProcessingMode() || indexRelation == NULL)
@@ -220,16 +221,18 @@ heap_clustered_write_index_can_sort(Relation relation, Relation indexRelation)
 						Anum_pg_index_indpred, NULL))
 		return false;
 
-	nkeys = indexRelation->rd_index->indnkeyatts;
-	if (nkeys <= 0 || nkeys > INDEX_MAX_KEYS)
+	natts = IndexRelationGetNumberOfAttributes(indexRelation);
+	nkeys = IndexRelationGetNumberOfKeyAttributes(indexRelation);
+	if (nkeys <= 0 || nkeys > natts || natts > INDEX_MAX_KEYS)
 		return false;
 
-	for (int i = 0; i < nkeys; i++)
+	for (int i = 0; i < natts; i++)
 	{
 		if (indexRelation->rd_index->indkey.values[i] <= 0)
 			return false;
 
-		if (!OidIsValid(index_getprocid(indexRelation, i + 1,
+		if (i < nkeys &&
+			!OidIsValid(index_getprocid(indexRelation, i + 1,
 										GIST_SORTSUPPORT_PROC)))
 			return false;
 	}
@@ -254,6 +257,7 @@ heap_prepare_clustered_write_sort(Relation relation,
 {
 	GISTSTATE  *giststate = NULL;
 	MemoryContext oldcontext;
+	int			natts;
 	int			nkeys;
 
 	context->nkeys = 0;
@@ -263,7 +267,8 @@ heap_prepare_clustered_write_sort(Relation relation,
 	if (!heap_clustered_write_index_can_sort(relation, indexRelation))
 		return 0;
 
-	nkeys = indexRelation->rd_index->indnkeyatts;
+	natts = IndexRelationGetNumberOfAttributes(indexRelation);
+	nkeys = IndexRelationGetNumberOfKeyAttributes(indexRelation);
 	context->sortCxt = AllocSetContextCreate(CurrentMemoryContext,
 											 "heap clustered write sort",
 											 ALLOCSET_DEFAULT_SIZES);
@@ -293,7 +298,7 @@ heap_prepare_clustered_write_sort(Relation relation,
 	{
 		items[i].hasClusterKey = true;
 
-		for (int key = 0; key < nkeys; key++)
+		for (int key = 0; key < natts; key++)
 		{
 			AttrNumber	attnum = indexRelation->rd_index->indkey.values[key];
 

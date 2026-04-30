@@ -362,7 +362,7 @@ CREATE TABLE clstr_write_gist (id int, p point, filler text) WITH (fillfactor = 
 INSERT INTO clstr_write_gist
 SELECT g, point(g, g), repeat('x', 1000)
 FROM generate_series(1, 20) AS g;
-CREATE INDEX clstr_write_gist_p ON clstr_write_gist USING gist (p);
+CREATE INDEX clstr_write_gist_p ON clstr_write_gist USING gist (p) INCLUDE (id);
 CLUSTER clstr_write_gist USING clstr_write_gist_p;
 INSERT INTO clstr_write_gist VALUES (1001, point(1.5, 1.5), repeat('y', 1000));
 SELECT count(*) AS rows, count(*) FILTER (WHERE p <@ box(point(1, 1), point(2, 2))) AS nearby
