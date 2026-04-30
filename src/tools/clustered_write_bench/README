@@ -67,13 +67,20 @@ the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 preferred way to compare small hot-path changes because single runs can be
 noisy even with `fsync=off`.  It also writes `server_version.txt`; check that
 file before comparing runs that were not started with `USE_TEMP_INSTANCE=true`.
+`locality.tsv` reports both `heap_blocks_touched` and `heap_block_span`.
+The span is useful for duplicate-key overflow experiments: a huge hot diff may
+not fit back inside the original key range, but it can still be compact if the
+new rows occupy a short contiguous run of heap blocks.
 Raw `psql` outputs are compressed with gzip by default; set
 `COMPRESS_RAW=false` to leave them as plain `.out` files.
 
 When `USE_TEMP_INSTANCE=true`, the temporary data directory and socket
 directory are removed after the run by default, leaving the logs and summaries
-behind.  Set `KEEP_TEMP_INSTANCE_DATA=true` only when you need to inspect the
-finished cluster.
+behind.  The socket directory is created under `${TMPDIR:-/tmp}` rather than
+inside `OUTDIR`, because PostgreSQL's Unix-domain socket path limit is short
+and long benchmark output paths otherwise fail before the run starts.  Set
+`KEEP_TEMP_INSTANCE_DATA=true` only when you need to inspect the finished
+cluster.
 
 Larger scale values increase table and diff sizes.  The workload:
 
@@ -341,12 +348,20 @@ Do not repeat these paths blindly:
 * **One-opened-index-per-`heap_multi_insert` batch as a simplification:** kept
   out as a performance change because the single Georgia rerun did not beat
   the prior generated-geohash result (`1:59.29` create, `1:56.57` append).
+* **Append instead of FSM after clustered candidates are exhausted:** rejected
+  for now.  The synthetic span metric showed the real hot-key problem earlier:
+  duplicate-key rows consume fillfactor reserve across many clustered-neighbour
+  pages before the exhausted-candidate fallback matters.  A local prototype
+  that appended after candidate exhaustion, plus an all-hot multi-insert append
+  variant, left scale `1`, hot `0.9` `insert_hot` spans unchanged (`3737`
+  blocks at heap fillfactor `90`, `6596` at fillfactor `50`), so this needs
+  prefix grouping/sorting rather than a late fallback tweak.
 
 The useful lesson from the rejected hot-prefix work is that duplicate-key
 batches need either a genuinely local page-selection policy for the repeated
-key or a very cheap decision to stop spending clustered-write work on that key.
-Adding more eager probes or more per-tuple branching has repeatedly moved the
-cost curve in the wrong direction.
+key, or enough prefix grouping that the already-kept all-hot guard can keep the
+overflow compact.  Adding more eager probes, late FSM fallback tweaks, or more
+per-tuple branching has repeatedly moved the cost curve in the wrong direction.
 
 Important output columns:
 
@@ -372,5 +387,8 @@ Important output columns:
   the tile's original clustered heap block range.
 * `avg_block_drift`, `p95_block_drift`, `max_block_drift`: lower is better;
   block distance outside the original tile range.
+* `heap_block_span`: lower is better for the measured diff rows themselves;
+  this is `max(heap_block) - min(heap_block) + 1`, so it catches whether an
+  overflow tail is compact even when it cannot fit inside the old base range.
 * `heap_blocks_touched`: lower can be better for locality, but interpret it
   with the drift metrics because very small values can also mean hot spots.

@@ -29,9 +29,8 @@ if [[ "$USE_TEMP_INSTANCE" == "true" ]]; then
 	fi
 
 	PGDATA="$OUTDIR/pgdata"
-	PGHOST="$OUTDIR/socket"
+	PGHOST=$(mktemp -d "${TMPDIR:-/tmp}/clustered-write-bench-socket.XXXXXX")
 	export PGHOST PGPORT
-	mkdir -p "$PGHOST"
 	PSQL="$PG_BINDIR/psql"
 
 	"$PG_BINDIR/initdb" -D "$PGDATA" --auth trust --no-sync --no-instructions \
@@ -45,8 +44,9 @@ if [[ "$USE_TEMP_INSTANCE" == "true" ]]; then
 		"$PG_BINDIR/pg_ctl" -D "$PGDATA" stop -m fast \
 			>"$OUTDIR/pg_ctl_stop.log" 2>&1 || true
 		if [[ "$KEEP_TEMP_INSTANCE_DATA" != "true" ]]; then
-			rm -rf "$PGDATA" "$PGHOST"
+			rm -rf "$PGDATA"
 		fi
+		rm -rf "$PGHOST"
 	}
 	trap stop_temp_instance EXIT
 fi
@@ -61,7 +61,7 @@ timing_summary_tsv="$OUTDIR/timing_summary.tsv"
 locality_summary_tsv="$OUTDIR/locality_summary.tsv"
 
 printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\tstep\telapsed_ms\n' >"$timings_tsv"
-printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
+printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\theap_block_span\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
 
 for scale in $SCALE_VALUES; do
 	for brin in $BRIN_VALUES; do
@@ -113,8 +113,8 @@ SQL
 								-v hot_tile_fraction="$hot_tile_fraction" \
 								'$4 == "clustered_write" ||
 								 $4 == "without_cluster_metadata" {
-									printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-										run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, $4, $5, $6, $7, $8, $9, $10, $11
+									printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+										run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, $4, $5, $6, $7, $8, $9, $10, $11, $12
 								}' "$raw" >>"$locality_tsv"
 
 							if [[ "$COMPRESS_RAW" == "true" ]]; then
@@ -163,21 +163,23 @@ awk -F'\t' '
 		print "scale", "brin_enabled", "single_key_cluster",
 		      "text_cluster_key", "heap_fillfactor", "hot_tile_fraction",
 		      "variant", "diff_kind", "runs",
-		      "avg_pct_inside_base_range", "avg_block_drift",
-		      "avg_p95_block_drift"
+		      "avg_heap_block_span", "avg_pct_inside_base_range",
+		      "avg_block_drift", "avg_p95_block_drift"
 	}
 	NR > 1 {
 		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9
-		pct[key] += $12
-		avg[key] += $13
-		p95[key] += $14
+		span[key] += $12
+		pct[key] += $13
+		avg[key] += $14
+		p95[key] += $15
 		count[key]++
 	}
 	END {
 		for (key in count)
-			printf "%s\t%d\t%.2f\t%.2f\t%.2f\n",
-				key, count[key], pct[key] / count[key],
-				avg[key] / count[key], p95[key] / count[key]
+			printf "%s\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n",
+				key, count[key], span[key] / count[key],
+				pct[key] / count[key], avg[key] / count[key],
+				p95[key] / count[key]
 	}
 ' "$locality_tsv" >"$locality_summary_tsv"
 {
