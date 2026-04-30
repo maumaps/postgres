@@ -46,6 +46,16 @@ static bool ClusteredWriteRememberCandidate(Relation relation,
 											BlockNumber *candidates,
 											Size *candidateFreeSpace,
 											int *ncandidates);
+static void ClusteredWriteRememberPrefixCandidates(Relation relation,
+												   Relation indexRelation,
+												   BlockNumber nblocks,
+												   ScanKey skey,
+												   int nscankeys,
+												   ScanDirection direction,
+												   BlockNumber *candidates,
+												   Size *candidateFreeSpace,
+												   int *ncandidates,
+												   int *ntuples);
 static int RelationGetClusteredTargetBlocksForTuple(Relation relation,
 													HeapTuple tuple,
 													Size len,
@@ -186,6 +196,48 @@ ClusteredWriteRememberCandidate(Relation relation, BlockNumber nblocks,
 }
 
 /*
+ * Remember candidate pages from one bounded scan of a btree equality-prefix
+ * range.  Callers run this in both directions so large duplicate-key or
+ * prefix-key ranges contribute pages from each edge instead of only from the
+ * oldest/lowest TIDs.
+ */
+static void
+ClusteredWriteRememberPrefixCandidates(Relation relation,
+									   Relation indexRelation,
+									   BlockNumber nblocks,
+									   ScanKey skey,
+									   int nscankeys,
+									   ScanDirection direction,
+									   BlockNumber *candidates,
+									   Size *candidateFreeSpace,
+									   int *ncandidates,
+									   int *ntuples)
+{
+	IndexScanDesc scan;
+	ItemPointer tid;
+
+	Assert(nscankeys > 0);
+
+	scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
+						   nscankeys, 0, 0);
+	index_rescan(scan, skey, nscankeys, NULL, 0);
+
+	while ((tid = index_getnext_tid(scan, direction)) != NULL)
+	{
+		if (++(*ntuples) > CLUSTERED_WRITE_MAX_INDEX_TIDS)
+			break;
+
+		ClusteredWriteRememberCandidate(relation, nblocks, tid,
+										candidates, candidateFreeSpace,
+										ncandidates);
+		if (*ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+			break;
+	}
+
+	index_endscan(scan);
+}
+
+/*
  * RelationGetClusteredTargetBlocksFromIndex
  *
  * For relations with CLUSTER metadata, try to use the clustered index to find
@@ -223,7 +275,6 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	int			ntuples = 0;
 	int			ncandidates = 0;
 	int			ntargets = 0;
-	bool		useBtreePrefixProbe = false;
 
 	Assert(maxTargetBlocks > 0);
 
@@ -236,8 +287,6 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 
 	nkeys = indexRelation->rd_index->indnkeyatts;
 	nblocks = RelationGetNumberOfBlocks(relation);
-
-	useBtreePrefixProbe = true;
 
 	for (int i = 0; i < nkeys; i++)
 	{
@@ -273,38 +322,33 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	}
 
 	if (nscankeys == 0)
-		useBtreePrefixProbe = false;
-
-	if (!useBtreePrefixProbe)
 		return 0;
 
 	for (int probeKeys = nscankeys; probeKeys > 0; probeKeys--)
 	{
 		/*
 		 * Plain btree keys can use equality scan keys and retry shorter left
-		 * prefixes.  Unqualified scans are deliberately skipped because they
-		 * are not anchored to the tuple being inserted.
+		 * prefixes.  Probe each matching range from both ends, so very large
+		 * duplicate-key ranges do not only contribute their first, often-full
+		 * heap pages.  Unqualified scans are deliberately skipped because
+		 * they are not anchored to the tuple being inserted.
 		 */
-		scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
-							   probeKeys, 0, 0);
-		index_rescan(scan, probeKeys > 0 ? skey : NULL, probeKeys, NULL, 0);
+		ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
+											   nblocks, skey, probeKeys,
+											   ForwardScanDirection,
+											   candidates, candidateFreeSpace,
+											   &ncandidates, &ntuples);
 
-		while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
-		{
-			if (++ntuples > CLUSTERED_WRITE_MAX_INDEX_TIDS)
-				break;
+		if (ntuples < CLUSTERED_WRITE_MAX_INDEX_TIDS &&
+			ncandidates < CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
+			ClusteredWriteRememberPrefixCandidates(relation, indexRelation,
+												   nblocks, skey, probeKeys,
+												   BackwardScanDirection,
+												   candidates,
+												   candidateFreeSpace,
+												   &ncandidates, &ntuples);
 
-			ClusteredWriteRememberCandidate(relation, nblocks, tid,
-											candidates, candidateFreeSpace,
-											&ncandidates);
-			if (ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
-				break;
-		}
-
-		index_endscan(scan);
-
-		if (nscankeys == 0 ||
-			ntuples >= CLUSTERED_WRITE_MAX_INDEX_TIDS ||
+		if (ntuples >= CLUSTERED_WRITE_MAX_INDEX_TIDS ||
 			ncandidates >= CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
 			break;
 	}
@@ -317,7 +361,7 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 	 * it.  That gives brand-new clustered keys a chance to land beside
 	 * adjacent key ranges instead of being appended in input order.
 	 */
-	if (ncandidates == 0 && useBtreePrefixProbe && nscankeys > 0)
+	if (ncandidates == 0 && nscankeys > 0)
 	{
 		ScanKeyData rangeKey;
 		Oid			rangeOperator;
