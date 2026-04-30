@@ -172,21 +172,42 @@ awk -F'\t' '
 		print "scale", "brin_enabled", "single_key_cluster",
 		      "text_cluster_key", "heap_fillfactor", "hot_tile_fraction",
 		      "order_diff_by_cluster_key", "step", "runs",
-		      "avg_elapsed_ms", "min_elapsed_ms", "max_elapsed_ms"
+		      "avg_elapsed_ms", "median_elapsed_ms", "min_elapsed_ms",
+		      "max_elapsed_ms"
 	}
 	NR > 1 {
 		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9
 		sum[key] += $10
 		count[key]++
+		sample[key, count[key]] = $10
 		if (!(key in min) || $10 < min[key])
 			min[key] = $10
 		if (!(key in max) || $10 > max[key])
 			max[key] = $10
 	}
 	END {
+		for (key in count) {
+			for (i = 1; i <= count[key]; i++)
+				value[i] = sample[key, i] + 0
+			for (i = 1; i <= count[key]; i++) {
+				for (j = i + 1; j <= count[key]; j++) {
+					if (value[i] <= value[j])
+						continue
+					tmp = value[i]
+					value[i] = value[j]
+					value[j] = tmp
+				}
+			}
+			median_pos = int((count[key] + 1) / 2)
+			if (count[key] % 2)
+				median[key] = value[median_pos]
+			else
+				median[key] = (value[median_pos] + value[median_pos + 1]) / 2
+		}
 		for (key in count)
-			printf "%s\t%d\t%.2f\t%.2f\t%.2f\n",
-				key, count[key], sum[key] / count[key], min[key], max[key]
+			printf "%s\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n",
+				key, count[key], sum[key] / count[key], median[key],
+				min[key], max[key]
 	}
 ' "$timings_tsv" >"$timing_summary_tsv"
 {

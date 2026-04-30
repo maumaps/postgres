@@ -95,6 +95,9 @@ the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 preferred way to compare small hot-path changes because single runs can be
 noisy even with `fsync=off`.  It also writes `server_version.txt`; check that
 file before comparing runs that were not started with `USE_TEMP_INSTANCE=true`.
+`timing_summary.tsv` reports average, median, minimum, and maximum elapsed
+milliseconds for each step, so a single scheduler hiccup is visible instead of
+silently moving the headline number.
 Each run also writes `run_environment.txt` with the git head, benchmark
 settings, uptime/load, filesystem space, and selected PostgreSQL bindir, so
 noisy timing comparisons can be traced back to the build and host state.
@@ -496,6 +499,9 @@ Important output columns:
 * `step` and `elapsed_ms`: structured timing rows for the diff insert/update
   statements, emitted before the locality summary so runs can be compared
   without scraping `psql` timing chatter.
+* `avg_elapsed_ms`, `median_elapsed_ms`, `min_elapsed_ms`, `max_elapsed_ms`:
+  aggregate timing columns in `timing_summary.tsv`; prefer the median when the
+  run environment shows high load or a small number of outliers.
 * `pct_inside_base_range`: higher is better; percent of diff tuples still inside
   the tile's original clustered heap block range.
 * `avg_block_drift`, `p95_block_drift`, `max_block_drift`: lower is better;
