@@ -45,7 +45,8 @@ static bool ClusteredWriteRememberCandidate(Relation relation,
 											ItemPointer tid,
 											BlockNumber *candidates,
 											Size *candidateFreeSpace,
-											int *ncandidates);
+											int *ncandidates,
+											int maxCandidates);
 static bool ClusteredWriteHasFittingCandidate(Size *candidateFreeSpace,
 											  int ncandidates,
 											  Size len);
@@ -175,11 +176,18 @@ RelationPutHeapTuple(Relation relation,
 static bool
 ClusteredWriteRememberCandidate(Relation relation, BlockNumber nblocks,
 								ItemPointer tid, BlockNumber *candidates,
-								Size *candidateFreeSpace, int *ncandidates)
+								Size *candidateFreeSpace, int *ncandidates,
+								int maxCandidates)
 {
 	BlockNumber candidate;
 
+	Assert(maxCandidates > 0);
+	Assert(maxCandidates <= CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
+
 	if (tid == NULL)
+		return false;
+
+	if (*ncandidates >= maxCandidates)
 		return false;
 
 	candidate = ItemPointerGetBlockNumber(tid);
@@ -253,7 +261,7 @@ ClusteredWriteRememberPrefixCandidates(Relation relation,
 
 		ClusteredWriteRememberCandidate(relation, nblocks, tid,
 										candidates, candidateFreeSpace,
-										ncandidates);
+										ncandidates, candidateLimit);
 		if (*ncandidates >= candidateLimit)
 			break;
 	}
@@ -443,7 +451,8 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 				ClusteredWriteRememberCandidate(relation, nblocks, tid,
 												candidates,
 												candidateFreeSpace,
-												&ncandidates);
+												&ncandidates,
+												CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
 			}
 			index_endscan(scan);
 		}
@@ -471,7 +480,8 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 				ClusteredWriteRememberCandidate(relation, nblocks, tid,
 												candidates,
 												candidateFreeSpace,
-												&ncandidates);
+												&ncandidates,
+												CLUSTERED_WRITE_MAX_HEAP_BLOCKS);
 			}
 			index_endscan(scan);
 		}
