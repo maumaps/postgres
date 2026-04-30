@@ -181,8 +181,11 @@ Rewriting the final heap by `osm2pgsql_cluster_key, osm_id` fixed that
 diagnosis: correlation became `1` for point, line, polygon, and roads, while
 p95 span returned close to the stock geometry-clustered baseline.  The cost is
 a real table rewrite and a slightly larger database, so this is best read as
-the correctness/performance target for a future streaming or bounded-buffer
-sort before COPY rather than as proof that the pre-COPY btree alone is enough.
+the correctness/performance target for a future global or external sort before
+COPY rather than as proof that the pre-COPY btree alone is enough.  Small
+bounded in-memory COPY sort windows were tested after this point and rejected:
+they lowered or raised initial import time depending on the window, but left
+`osm2pgsql_cluster_key` correlation poor and made diff append much slower.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
@@ -273,6 +276,15 @@ Do not repeat these paths blindly:
 * **Pre-COPY clustered GiST index on `way`:** rejected as an osm2pgsql import
   strategy.  It worked functionally, but GiST maintenance during ingest was
   too expensive (`4:53.68` create, `5:30.27` append in the Georgia run).
+* **Bounded in-memory pre-COPY geohash sort in osm2pgsql:** rejected as a
+  replacement for the final generated-key rewrite.  An `8192`-row table-local
+  buffer had `1:35.15` create and `4:33.82` append, with poor key correlation
+  (`line=-0.0787`, `point=-0.2400`, `polygon=-0.6597`, `roads=0.1146`) and
+  long p95 spans (`15412`, `2187`, `20392.5`).  A larger `65536`-row buffer was
+  worse on write time (`2:21.27` create, `5:11.02` append) and still did not
+  repair correlation (`line≈0`, `point=-0.1958`, `polygon=-0.6488`,
+  `roads=0.4155`).  The copy stream needs a global/external sort, not this
+  small micro-sort.
 * **One-opened-index-per-`heap_multi_insert` batch as a simplification:** kept
   out as a performance change because the single Georgia rerun did not beat
   the prior generated-geohash result (`1:59.29` create, `1:56.57` append).
