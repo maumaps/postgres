@@ -126,7 +126,41 @@ are shared across variants.
 
 The script copies PostGIS extension SQL and shared libraries into non-system
 PostgreSQL installs before creating the test database.  This keeps the patched
-build usable without installing it globally.
+build usable without installing it globally.  If `POSTGIS_SHARE` and
+`POSTGIS_LIB` already point at the selected non-system PostgreSQL install, the
+copy step is skipped so the benchmark can also use a locally built PostGIS
+extension in-place.
+
+The simplified daily diff is written through a temporary `.osc.gz` file with an
+explicit `osmium` output format.  That keeps the preparation step independent
+of temporary suffixes, while preserving a gzip-compressed input for repeated
+append runs.
+
+One verified run used planet daily diff `000/004/978.osc.gz`, Geofabrik
+Georgia, stock osm2pgsql `2.2.0`, and `OSM2PGSQL_CACHE_MB=1024`
+`OSM2PGSQL_PROCS=2`.  The `baseline_stock` row was PostgreSQL `18.3` with
+PostGIS `3.6`; the `patched_stock` row was this branch's PostgreSQL `19devel`
+build with locally built PostGIS `3.7.0dev`.
+
+| variant | create elapsed | append elapsed | database size |
+| --- | ---: | ---: | ---: |
+| baseline_stock | 2:13.29 | 2:43.53 | 2726 MB |
+| patched_stock | 2:54.12 | 2:41.17 | 2728 MB |
+
+Read/locality summary from the same run:
+
+| variant | bbox point | bbox line | bbox polygon | roads exact | polygon exact | locality summary | line p95 blocks/span | point p95 blocks/span | polygon p95 blocks/span |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline_stock | 213.205 ms | 608.002 ms | 1289.247 ms | 584.712 ms | 2784.592 ms | 20463.716 ms | 7 / 2381 | 6 / 1002 | 32 / 1208 |
+| patched_stock | 267.111 ms | 2381.184 ms | 1144.408 ms | 99.757 ms | 2215.158 ms | 9645.548 ms | 7 / 2381 | 6 / 1002 | 32 / 1208 |
+
+The current result is mixed rather than a victory lap: the patched run keeps
+append time roughly flat and improves the exact polygon/roads reads in this
+run, but initial import and bbox line reads are worse.  The locality aggregate
+is identical for the two stock-osm2pgsql variants, which means this run mainly
+validates the end-to-end harness and PostgreSQL/PostGIS compatibility; it does
+not yet prove that stock osm2pgsql diff imports preserve clustered geometry
+layout better.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql

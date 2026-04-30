@@ -117,6 +117,7 @@ simplify_daily_diff()
 {
     local in_file="$1"
     local out_file="${in_file%.osc.gz}-simplified.osc.gz"
+    local tmp_file="$out_file.tmp.osc.gz"
 
     if [[ -s "$out_file" && "$out_file" -nt "$in_file" ]]; then
         log "using existing simplified diff $out_file"
@@ -125,8 +126,12 @@ simplify_daily_diff()
     fi
 
     log "simplifying daily diff for osm2pgsql append"
-    "$OSMIUM" merge-changes -s -O -o "$out_file".tmp "$in_file"
-    mv "$out_file".tmp "$out_file"
+    rm -f "$tmp_file"
+    if ! "$OSMIUM" merge-changes -s -O --output-format=osc.gz -o "$tmp_file" "$in_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    mv "$tmp_file" "$out_file"
     printf '%s\n' "$out_file"
 }
 
@@ -134,6 +139,8 @@ copy_postgis_into_install()
 {
     local pg_bin="$1"
     local pg_home
+    local pg_extension_dir
+    local pg_lib_dir
     pg_home="$(cd "$pg_bin/.." && pwd)"
 
     if [[ "$pg_bin" == /usr/lib/postgresql/* ]]; then
@@ -141,10 +148,17 @@ copy_postgis_into_install()
     fi
 
     mkdir -p "$pg_home/share/extension" "$pg_home/lib"
-    cp -a "$POSTGIS_SHARE"/postgis* "$pg_home/share/extension/"
-    cp -a "$POSTGIS_SHARE"/address_standardizer* "$pg_home/share/extension/" 2>/dev/null || true
-    cp -a "$POSTGIS_LIB"/postgis-*.so "$pg_home/lib/"
-    cp -a "$POSTGIS_LIB"/postgis_raster-*.so "$pg_home/lib/" 2>/dev/null || true
+    pg_extension_dir="$(cd "$pg_home/share/extension" && pwd -P)"
+    pg_lib_dir="$(cd "$pg_home/lib" && pwd -P)"
+
+    if [[ "$(cd "$POSTGIS_SHARE" && pwd -P)" != "$pg_extension_dir" ]]; then
+        cp -a "$POSTGIS_SHARE"/postgis* "$pg_home/share/extension/"
+        cp -a "$POSTGIS_SHARE"/address_standardizer* "$pg_home/share/extension/" 2>/dev/null || true
+    fi
+    if [[ "$(cd "$POSTGIS_LIB" && pwd -P)" != "$pg_lib_dir" ]]; then
+        cp -a "$POSTGIS_LIB"/postgis-*.so "$pg_home/lib/"
+        cp -a "$POSTGIS_LIB"/postgis_raster-*.so "$pg_home/lib/" 2>/dev/null || true
+    fi
 }
 
 start_server()
