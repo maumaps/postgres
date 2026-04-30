@@ -62,7 +62,7 @@ timing_summary_tsv="$OUTDIR/timing_summary.tsv"
 locality_summary_tsv="$OUTDIR/locality_summary.tsv"
 
 printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tstep\telapsed_ms\n' >"$timings_tsv"
-printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\theap_block_span\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
+printf 'run\tscale\tbrin_enabled\tsingle_key_cluster\ttext_cluster_key\theap_fillfactor\thot_tile_fraction\torder_diff_by_cluster_key\tvariant\tdiff_kind\trows_measured\theap_blocks_touched\theap_block_span\toutside_base_heap_block_span\tpct_inside_base_range\tavg_block_drift\tp95_block_drift\tmax_block_drift\n' >"$locality_tsv"
 
 for scale in $SCALE_VALUES; do
 	for brin in $BRIN_VALUES; do
@@ -118,8 +118,8 @@ SQL
 									-v order_diff_by_cluster_key="$order_diff_by_cluster_key" \
 									'$4 == "clustered_write" ||
 									 $4 == "without_cluster_metadata" {
-										printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-											run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, order_diff_by_cluster_key, $4, $5, $6, $7, $8, $9, $10, $11, $12
+										printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+											run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, order_diff_by_cluster_key, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
 									}' "$raw" >>"$locality_tsv"
 
 								if [[ "$COMPRESS_RAW" == "true" ]]; then
@@ -169,23 +169,25 @@ awk -F'\t' '
 		print "scale", "brin_enabled", "single_key_cluster",
 		      "text_cluster_key", "heap_fillfactor", "hot_tile_fraction",
 		      "order_diff_by_cluster_key", "variant", "diff_kind", "runs",
-		      "avg_heap_block_span", "avg_pct_inside_base_range",
+		      "avg_heap_block_span", "avg_outside_base_heap_block_span",
+		      "avg_pct_inside_base_range",
 		      "avg_block_drift", "avg_p95_block_drift"
 	}
 	NR > 1 {
 		key = $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9 OFS $10
 		span[key] += $13
-		pct[key] += $14
-		avg[key] += $15
-		p95[key] += $16
+		outside_span[key] += $14
+		pct[key] += $15
+		avg[key] += $16
+		p95[key] += $17
 		count[key]++
 	}
 	END {
 		for (key in count)
-			printf "%s\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n",
+			printf "%s\t%d\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\n",
 				key, count[key], span[key] / count[key],
-				pct[key] / count[key], avg[key] / count[key],
-				p95[key] / count[key]
+				outside_span[key] / count[key], pct[key] / count[key],
+				avg[key] / count[key], p95[key] / count[key]
 	}
 ' "$locality_tsv" >"$locality_summary_tsv"
 {

@@ -69,6 +69,13 @@ keeps small grouped diffs local, but means the `insert_hot` span can still look
 large because a few hot rows remain in the old clustered range while the rest
 append at the tail.  The split `insert_hot`/`insert_rest` metrics make that
 tradeoff visible instead of hiding it in one aggregate.
+The later outside-base span metric makes this sharper: in a focused scale `1`,
+hot `0.9`, repeat `2` run, fillfactor `90` clustered `insert_hot` had full
+`heap_block_span=3773`, but `outside_base_heap_block_span=384`, exactly
+matching the control tail span.  At fillfactor `50`, the clustered outside-base
+span was `692` versus control `693`.  The overflow run is therefore compact
+after it leaves the old range; the large full span means "reserve rows plus
+compact tail", not scattered tail placement.
 
 Set `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` to run the insert diff
 with an explicit `ORDER BY tile_id, osm_id`.  This is a diagnostic upper bound
@@ -88,10 +95,12 @@ the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 preferred way to compare small hot-path changes because single runs can be
 noisy even with `fsync=off`.  It also writes `server_version.txt`; check that
 file before comparing runs that were not started with `USE_TEMP_INSTANCE=true`.
-`locality.tsv` reports both `heap_blocks_touched` and `heap_block_span`.
-The span is useful for duplicate-key overflow experiments: a huge hot diff may
-not fit back inside the original key range, but it can still be compact if the
-new rows occupy a short contiguous run of heap blocks.
+`locality.tsv` reports `heap_blocks_touched`, `heap_block_span`, and
+`outside_base_heap_block_span`.  The full span is useful for duplicate-key
+overflow experiments, but it can overstate a mixed shape where a few rows still
+fit inside the old clustered range and the rest append compactly at the tail.
+The outside-base span measures only rows outside the original key range, making
+the actual overflow tail compactness visible.
 Raw `psql` outputs are compressed with gzip by default; set
 `COMPRESS_RAW=false` to leave them as plain `.out` files.
 
@@ -491,5 +500,9 @@ Important output columns:
 * `heap_block_span`: lower is better for the measured diff rows themselves;
   this is `max(heap_block) - min(heap_block) + 1`, so it catches whether an
   overflow tail is compact even when it cannot fit inside the old base range.
+* `outside_base_heap_block_span`: lower is better for rows that did not fit
+  inside the old clustered key range.  This helps separate a genuinely scattered
+  overflow tail from the expected mixed case where a few reserve-space rows
+  remain local and the rest append compactly.
 * `heap_blocks_touched`: lower can be better for locality, but interpret it
   with the drift metrics because very small values can also mean hot spots.

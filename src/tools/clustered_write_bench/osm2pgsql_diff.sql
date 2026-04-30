@@ -383,6 +383,11 @@ select s.brin_enabled,
        count(*) as rows_measured,
        count(distinct heap_block) as heap_blocks_touched,
        max(heap_block) - min(heap_block) + 1 as heap_block_span,
+       coalesce(
+           max(heap_block) filter (where block_drift > 0) -
+           min(heap_block) filter (where block_drift > 0) + 1,
+           0
+       ) as outside_base_heap_block_span,
        round(100.0 * avg((block_drift = 0)::int), 2) as pct_inside_base_range,
        round(avg(block_drift)::numeric, 2) as avg_block_drift,
        round((percentile_cont(0.95) within group (order by block_drift))::numeric, 2) as p95_block_drift,
