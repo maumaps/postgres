@@ -373,13 +373,22 @@ Do not repeat these paths blindly:
   at fillfactor `50`).  The kept fix pairs the tail fallback with a stricter
   target-free-space check for clustered candidates.
 * **Per-row scans of already-exhausted hot prefixes:** fixed with a small
-  heap-AM overflow cache for by-value leading clustered keys.  After the
+  heap-AM overflow cache for leading clustered keys.  After the
   target-free-space fix made the hot-key span compact, `insert into ... select`
   still paid an index probe for every row in the same exhausted `tile_id`.
   Remembering the exhausted prefix and current tail block brought the scale `1`,
-  hot `0.9` clustered insert from `1194.27 ms` / `1079.02 ms` at fillfactor
-  `90` / `50` to `70.85 ms` / `82.54 ms`, while preserving the compact
-  `insert_hot` spans (`384` / `693` blocks).
+  hot `0.9` integer clustered insert from `1194.27 ms` / `1079.02 ms` at
+  fillfactor `90` / `50` to `70.85 ms` / `82.54 ms`, while preserving the
+  compact `insert_hot` spans (`384` / `693` blocks).
+* **By-reference clustered prefixes in the overflow cache:** fixed after the
+  by-value cache left generated text keys on the slow path.  Before copying
+  varlena prefixes into `CacheMemoryContext`, scale `1` text hot inserts still
+  took roughly `770-805 ms`.  With bounded cached text prefixes, the same
+  text-key matrix falls to `60.69-121.84 ms` depending on fillfactor,
+  single-key mode, and hot fraction.  A same-backend smoke test that overwrote
+  `128` text prefixes through a `32`-entry cache held `CacheMemoryContext`
+  steady at `1048576` total bytes / `788232` used bytes before and after
+  `16384` additional inserts.
 
 The useful lesson from the rejected hot-prefix work is that duplicate-key
 batches need either a genuinely local page-selection policy for the repeated

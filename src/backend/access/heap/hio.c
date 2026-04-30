@@ -27,6 +27,7 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
@@ -50,13 +51,15 @@ typedef struct HeapClusteredWriteOverflowEntry
 	Oid			overflowCollation;
 	RegProcedure overflowEqProc;
 	Datum		overflowValue;
+	int16		overflowTypLen;
+	bool		overflowTypByVal;
 	BlockNumber overflowTargetBlock;
 } HeapClusteredWriteOverflowEntry;
 
 typedef struct HeapClusteredWriteCache
 {
 	uint32		magic;
-	int			overflowNextEntry;
+	uint32		overflowNextEntry;
 	HeapClusteredWriteOverflowEntry overflowEntries[CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES];
 } HeapClusteredWriteCache;
 
@@ -96,6 +99,10 @@ static void ClusteredWriteRememberOverflowTarget(Relation relation,
 												 BlockNumber targetBlock);
 static void ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
 													 BlockNumber targetBlock);
+static void ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
+											 Datum value,
+											 bool typByVal,
+											 int16 typLen);
 
 /*
  * RelationCanUseClusteredTargetProbe
@@ -607,6 +614,29 @@ ClusteredWriteGetCache(Relation relation)
 	return cache;
 }
 
+static void
+ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
+								 Datum value, bool typByVal, int16 typLen)
+{
+	MemoryContext oldcontext;
+
+	if (entry->active && !entry->overflowTypByVal)
+		pfree(DatumGetPointer(entry->overflowValue));
+
+	entry->overflowTypByVal = typByVal;
+	entry->overflowTypLen = typLen;
+
+	if (typByVal)
+	{
+		entry->overflowValue = value;
+		return;
+	}
+
+	oldcontext = MemoryContextSwitchTo(CacheMemoryContext);
+	entry->overflowValue = datumCopy(value, typByVal, typLen);
+	MemoryContextSwitchTo(oldcontext);
+}
+
 static bool
 ClusteredWriteGetCachedOverflowTarget(Relation relation, HeapTuple tuple,
 									  BlockNumber *targetBlock)
@@ -663,6 +693,7 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 	Datum		prefixValue;
 	bool		prefixIsNull;
 	bool		typByVal;
+	int16		typLen;
 
 	if (tuple == NULL || !BlockNumberIsValid(targetBlock))
 		return;
@@ -683,8 +714,8 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 
 	attnum = indexRelation->rd_index->indkey.values[0];
 	typeOid = indexRelation->rd_opcintype[0];
-	typByVal = get_typbyval(typeOid);
-	if (attnum <= 0 || !typByVal)
+	get_typlenbyval(typeOid, &typLen, &typByVal);
+	if (attnum <= 0)
 	{
 		index_close(indexRelation, AccessShareLock);
 		return;
@@ -717,7 +748,6 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 	if (cache != NULL)
 	{
 		HeapClusteredWriteOverflowEntry *entry = NULL;
-		int			insertAt;
 
 		for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
 		{
@@ -753,17 +783,19 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 
 		if (entry == NULL)
 		{
+			uint32		insertAt;
+
 			insertAt = cache->overflowNextEntry++ %
 				CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES;
 			entry = &cache->overflowEntries[insertAt];
 		}
 
-		entry->active = true;
 		entry->overflowAttnum = attnum;
 		entry->overflowCollation = indexRelation->rd_indcollation[0];
 		entry->overflowEqProc = eqProc;
-		entry->overflowValue = prefixValue;
+		ClusteredWriteStoreOverflowValue(entry, prefixValue, typByVal, typLen);
 		entry->overflowTargetBlock = targetBlock;
+		entry->active = true;
 	}
 
 	index_close(indexRelation, AccessShareLock);

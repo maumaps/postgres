@@ -121,6 +121,23 @@ WHERE id IN (1001, 1002)
 ORDER BY id;
 DROP TABLE clstr_write_btree;
 
+-- Verify that by-reference clustered keys use the same bounded overflow path.
+CREATE TABLE clstr_write_text_overflow (id int, k text COLLATE "C", filler text) WITH (fillfactor = 10);
+INSERT INTO clstr_write_text_overflow
+SELECT g, CASE WHEN g <= 200 THEN 'a' ELSE 'b' END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_text_overflow_k_id ON clstr_write_text_overflow (k, id);
+CLUSTER clstr_write_text_overflow USING clstr_write_text_overflow_k_id;
+INSERT INTO clstr_write_text_overflow VALUES (1001, 'a', repeat('y', 10));
+INSERT INTO clstr_write_text_overflow VALUES (1002, 'a', repeat('y', 10));
+SELECT id, tid_block(new_row.ctid) <=
+	(SELECT max(tid_block(ctid)) FROM clstr_write_text_overflow WHERE k = 'a' AND id NOT IN (1001, 1002))
+	AS used_clustered_key_reserve
+FROM clstr_write_text_overflow AS new_row
+WHERE id IN (1001, 1002)
+ORDER BY id;
+DROP TABLE clstr_write_text_overflow;
+
 -- Verify that reordered clustered COPY batches keep each slot's TID.
 CREATE TABLE clstr_write_copy_tid (id int, k int, filler text) WITH (fillfactor = 10);
 INSERT INTO clstr_write_copy_tid
