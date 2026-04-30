@@ -495,6 +495,17 @@ Do not repeat these paths blindly:
   fillfactor `50`), but clustered insert medians were mixed and remained far
   above the control.  The raw gzip run is under
   `/home/kom/tmp/clustered-write-synthetic/current-nonhot-ordered-median-20260501-014236/`.
+* **Skipping clustered probes for singleton prefixes in a batch:** rejected.
+  This tried to reduce ordinary non-hot single-key cost by not probing the
+  clustered btree when a prefix appeared only once in the current
+  `heap_multi_insert` batch.  The focused scale `1`, repeat `2`, single-key
+  `hot=0` run did not change locality in the synthetic matrix and timings were
+  mixed/noisy rather than a reliable win (`ff90` integer ordered improved in
+  that run, while generated text cases remained mixed).  The policy is also
+  risky for genuinely sparse real diffs, where a singleton may still be the
+  only chance to preserve locality for that key.  The code experiment was
+  reverted; raw gzip output and the reverted patch are under
+  `/home/kom/tmp/clustered-write-synthetic/skip-singleton-prefix-experiment-20260501-015018/`.
 
 The useful lesson from the rejected hot-prefix work is that duplicate-key
 batches need either a genuinely local page-selection policy for the repeated
