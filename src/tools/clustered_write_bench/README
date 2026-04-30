@@ -28,10 +28,12 @@ closer to the experimental osm2pgsql generated-geohash index.
 Set `TEXT_KEY_VALUES="false true"` to repeat the run with a stored generated
 `text` clustering key.  This keeps the integer `tile_id` for locality
 measurement, but clusters on `cluster_key`, a deterministic text encoding of
-the same tile.  It is a cheap guard for geohash-like osm2pgsql experiments and
-varlena btree-prefix changes before spending time on the full Georgia import.
-When `use_brin=true`, the optional BRIN index follows the active clustering key
-(`tile_id` for integer mode, `cluster_key` for text mode).
+the same tile using `COLLATE "C"`, matching the experimental osm2pgsql
+generated-geohash key.  It is a cheap guard for geohash-like osm2pgsql
+experiments and varlena btree-prefix changes before spending time on the full
+Georgia import.  When `use_brin=true`, the optional BRIN index follows the
+active clustering key (`tile_id` for integer mode, `cluster_key` for text
+mode).
 
 Set `HOT_TILE_FRACTION_VALUES="0 0.9"` to stress duplicate-key diffs.  A value
 of `0.9` sends 90% of inserted diff rows to tile `1`, which exercises the case
@@ -41,13 +43,16 @@ When this value is greater than zero, locality output splits inserts into
 `insert_hot` for the forced duplicate-key rows and `insert_rest` for the
 remaining rows.  This keeps a hot-key cliff from being hidden by a small
 well-placed non-hot tail.
-The current by-value all-equal batch guard deliberately treats a fully hot
-integer/OID prefix batch as "stop spending clustered-write work": at scale `1`,
-single-key clustered insert improved from the previous clean-head `1330.10 ms`
-to `866.17 ms` at hot `0.9`, and from `1702.04 ms` to `725.13 ms` at hot `1.0`
-in the verified temp-instance run.  The hot rows still do not become local;
-the win is avoiding wasted clustered-index work until a real duplicate-key page
-selection policy exists.
+The current all-equal batch guard deliberately treats a fully hot simple prefix
+batch as "stop spending clustered-write work": at scale `1`, single-key
+integer/OID clustered insert improved from the previous clean-head
+`1330.10 ms` to `866.17 ms` at hot `0.9`, and from `1702.04 ms` to
+`725.13 ms` at hot `1.0` in the verified temp-instance run.  The same guard is
+also allowed for generated `text COLLATE "C"` keys, where a follow-up
+repeat-run improved fully hot text-key clustered insert from `979.47 ms` to
+`810.16 ms`.  The hot rows still do not become local; the win is avoiding
+wasted clustered-index work until a real duplicate-key page selection policy
+exists.
 
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
@@ -261,8 +266,9 @@ Do not repeat these paths blindly:
 * **Generic early all-equal hot-prefix shortcut:** rejected after the
   disk-pressure recovery run.  The broad version increased hot `0.9`/`1.0`
   scale `0.1` insert timings in smoke runs without changing locality.  The
-  kept variant is narrower: it only handles all-equal by-value integer/OID
-  prefixes and was accepted only after the scale `1` temp-instance run above.
+  kept variant is narrower: it handles all-equal by-value integer/OID prefixes
+  and generated `text COLLATE "C"` prefixes, both accepted only after targeted
+  scale `1` temp-instance runs.
 * **Per-tuple Datum equality fast-path for integer/OID prefixes:** rejected for
   now.  Even though integer `Datum` equality is semantically safe for the
   tested built-in types, adding the branch to ordinary prefix-cache hits did

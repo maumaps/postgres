@@ -125,6 +125,7 @@ typedef struct HeapTupleClusteredPrefixCountEntry
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
 static int	heap_clustered_write_item_cmp(const void *a, const void *b, void *arg);
+static bool heap_clustered_write_prefix_can_compare_all_equal(Oid typeOid);
 static bool heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid);
 static bool heap_clustered_write_index_can_sort(Relation relation,
 												Relation indexRelation);
@@ -235,6 +236,21 @@ heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
 	if (left->inputIndex > right->inputIndex)
 		return 1;
 	return 0;
+}
+
+static bool
+heap_clustered_write_prefix_can_compare_all_equal(Oid typeOid)
+{
+	if (heap_clustered_write_prefix_can_compare_by_datum(typeOid))
+		return true;
+
+	switch (typeOid)
+	{
+		case TEXTOID:
+			return true;
+		default:
+			return false;
+	}
 }
 
 static bool
@@ -2663,12 +2679,12 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				else
 				{
 					/*
-					 * Very hot by-value prefixes do not need the full prefix
+					 * Very hot simple prefixes do not need the full prefix
 					 * cache machinery.  If the whole COPY batch has the same
 					 * simple key, skip clustered placement before allocating
 					 * the cache and take the regular bulk/FSM path instead.
 					 */
-					if (heap_clustered_write_prefix_can_compare_by_datum(
+					if (heap_clustered_write_prefix_can_compare_all_equal(
 							clusteredIndexRelation->rd_opcintype[0]))
 					{
 						Datum		firstPrefixValue;
@@ -2676,6 +2692,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 						bool		firstPrefixIsNull;
 						bool		lastPrefixIsNull;
 						bool		allSamePrefix = false;
+						bool		comparePrefixByDatum;
+
+						comparePrefixByDatum =
+							heap_clustered_write_prefix_can_compare_by_datum(
+								clusteredIndexRelation->rd_opcintype[0]);
 
 						firstPrefixValue =
 							heap_getattr(heaptuples[0],
@@ -2688,25 +2709,73 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 										 relation->rd_att,
 										 &lastPrefixIsNull);
 
-						if (!firstPrefixIsNull && !lastPrefixIsNull &&
-							firstPrefixValue == lastPrefixValue)
+						if (!firstPrefixIsNull && !lastPrefixIsNull)
 						{
-							allSamePrefix = true;
-							for (i = 1; i < ntuples - 1; i++)
+							if (comparePrefixByDatum)
+								allSamePrefix =
+									firstPrefixValue == lastPrefixValue;
+							else
 							{
-								Datum		prefixValue;
-								bool		prefixIsNull;
+								MemoryContext oldcontext;
 
-								prefixValue =
-									heap_getattr(heaptuples[i],
-												 prefixCacheAttnum,
-												 relation->rd_att,
-												 &prefixIsNull);
-								if (prefixIsNull ||
-									prefixValue != firstPrefixValue)
+								prefixCacheCompareCxt =
+									AllocSetContextCreate(CurrentMemoryContext,
+														  "clustered hot prefix compare",
+														  ALLOCSET_DEFAULT_SIZES);
+								oldcontext =
+									MemoryContextSwitchTo(prefixCacheCompareCxt);
+								allSamePrefix =
+									DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																	  prefixCacheCollation,
+																	  firstPrefixValue,
+																	  lastPrefixValue));
+								MemoryContextSwitchTo(oldcontext);
+								MemoryContextReset(prefixCacheCompareCxt);
+							}
+
+							if (allSamePrefix)
+							{
+								for (i = 1; i < ntuples - 1; i++)
 								{
-									allSamePrefix = false;
-									break;
+									Datum		prefixValue;
+									bool		prefixIsNull;
+
+									prefixValue =
+										heap_getattr(heaptuples[i],
+													 prefixCacheAttnum,
+													 relation->rd_att,
+													 &prefixIsNull);
+									if (prefixIsNull)
+									{
+										allSamePrefix = false;
+										break;
+									}
+
+									if (comparePrefixByDatum)
+									{
+										if (prefixValue != firstPrefixValue)
+										{
+											allSamePrefix = false;
+											break;
+										}
+									}
+									else
+									{
+										MemoryContext oldcontext;
+
+										oldcontext =
+											MemoryContextSwitchTo(prefixCacheCompareCxt);
+										allSamePrefix =
+											DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																			  prefixCacheCollation,
+																			  firstPrefixValue,
+																			  prefixValue));
+										MemoryContextSwitchTo(oldcontext);
+										MemoryContextReset(prefixCacheCompareCxt);
+
+										if (!allSamePrefix)
+											break;
+									}
 								}
 							}
 						}
@@ -2739,10 +2808,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					for (i = 0; i < ntuples; i++)
 						prefixCountSlots[i] = -1;
 					prefixTargetCacheMask = prefixTargetCacheLimit - 1;
-					prefixCacheCompareCxt =
-						AllocSetContextCreate(CurrentMemoryContext,
-											  "clustered target cache compare",
-											  ALLOCSET_DEFAULT_SIZES);
+					if (prefixCacheCompareCxt == NULL)
+						prefixCacheCompareCxt =
+							AllocSetContextCreate(CurrentMemoryContext,
+												  "clustered target cache compare",
+												  ALLOCSET_DEFAULT_SIZES);
 
 					for (i = 0; i < ntuples; i++)
 					{
@@ -2852,6 +2922,11 @@ skip_clustered_prefix_cache:
 			{
 				heaptuple_skip_clustered_target_lookup = true;
 				clustered = NULL;
+				if (prefixCacheCompareCxt != NULL)
+				{
+					MemoryContextDelete(prefixCacheCompareCxt);
+					prefixCacheCompareCxt = NULL;
+				}
 			}
 			else
 			{

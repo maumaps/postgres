@@ -45,7 +45,7 @@ create unlogged table clustered_write_osm_diff_on
 (
     osm_id bigint primary key,
     tile_id int not null,
-    cluster_key text generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
+    cluster_key text collate "C" generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
     version int not null,
     payload text not null
 ) with (fillfactor = 90);
@@ -88,7 +88,7 @@ create unlogged table clustered_write_osm_diff_off
 (
     osm_id bigint primary key,
     tile_id int not null,
-    cluster_key text generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
+    cluster_key text collate "C" generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
     version int not null,
     payload text not null
 ) with (fillfactor = 90);

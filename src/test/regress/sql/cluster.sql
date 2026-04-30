@@ -148,6 +148,46 @@ RESET enable_bitmapscan;
 RESET enable_seqscan;
 DROP TABLE clstr_write_copy_tid;
 
+-- Verify all-equal clustered COPY batches also work with generated text keys.
+CREATE TABLE clstr_write_text_key (
+	id int PRIMARY KEY,
+	tile_id int,
+	cluster_key text COLLATE "C" GENERATED ALWAYS AS ('g' || lpad(tile_id::text, 8, '0')) STORED,
+	filler text
+) WITH (fillfactor = 10);
+INSERT INTO clstr_write_text_key (id, tile_id, filler)
+SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_text_key_cluster ON clstr_write_text_key (cluster_key);
+CLUSTER clstr_write_text_key USING clstr_write_text_key_cluster;
+COPY clstr_write_text_key (id, tile_id, filler) FROM stdin;
+1001	1	y
+1002	1	y
+1003	1	y
+1004	1	y
+1005	1	y
+1006	1	y
+1007	1	y
+1008	1	y
+1009	1	y
+1010	1	y
+1011	1	y
+1012	1	y
+1013	1	y
+1014	1	y
+1015	1	y
+1016	1	y
+1017	1	y
+1018	1	y
+1019	1	y
+1020	1	y
+\.
+SELECT count(*) AS copied,
+       count(*) FILTER (WHERE cluster_key = 'g00000001') AS generated_keys
+FROM clstr_write_text_key
+WHERE id >= 1001;
+DROP TABLE clstr_write_text_key;
+
 -- Verify that clustered writes do not break other clusterable AMs.
 CREATE TABLE clstr_write_gist (id int, p point, filler text) WITH (fillfactor = 50);
 INSERT INTO clstr_write_gist
