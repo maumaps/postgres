@@ -298,6 +298,14 @@ Do not repeat these paths blindly:
   column, so later append rows would stop computing `osm2pgsql_cluster_key`.
   The checked-in experiment uses `LIKE ... INCLUDING GENERATED` plus ordered
   `INSERT` instead.
+* **`datum_image_hash()` prefix cache for varlena leading keys:** rejected.
+  This tried to make the clustered btree prefix cache direct-mapped for the
+  generated text geohash key instead of doing linear opfamily equality checks.
+  On the Georgia `978` generated-preserving run it did not improve writes:
+  create regressed to `2:10.79` and append to `2:37.58`, while locality stayed
+  the same (`line 4/2362.25`, `point 4/1097`, `polygon 9/1289` p95
+  blocks/span).  Exact polygon reads were faster in that single run, but the
+  write path got worse, so the code change was reverted.
 * **One-opened-index-per-`heap_multi_insert` batch as a simplification:** kept
   out as a performance change because the single Georgia rerun did not beat
   the prior generated-geohash result (`1:59.29` create, `1:56.57` append).
