@@ -103,21 +103,23 @@ WHERE pg_class.oid=indexrelid
 	AND pg_class_2.relname = 'clstr_tst'
 	AND indisclustered;
 
--- Verify that clustered writes may use one fillfactor-reserve neighbor for a
--- clustered key, but repeated equal-prefix overflow is redirected to the tail.
+-- Verify that clustered writes may use a small number of fillfactor-reserve
+-- neighbors for a clustered key, but longer equal-prefix overflow is
+-- redirected to the tail.
 CREATE TABLE clstr_write_btree (id int, k int, filler text) WITH (fillfactor = 10);
 INSERT INTO clstr_write_btree
 SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
 FROM generate_series(1, 400) AS g;
 CREATE INDEX clstr_write_btree_k_id ON clstr_write_btree (k, id);
 CLUSTER clstr_write_btree USING clstr_write_btree_k_id;
-INSERT INTO clstr_write_btree VALUES (1001, 1, repeat('y', 10));
-INSERT INTO clstr_write_btree VALUES (1002, 1, repeat('y', 10));
+INSERT INTO clstr_write_btree
+SELECT 1000 + g, 1, repeat('y', 10)
+FROM generate_series(1, 9) AS g;
 SELECT id, tid_block(new_row.ctid) <=
-	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id NOT IN (1001, 1002))
+	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id <= 400)
 	AS used_clustered_key_reserve
 FROM clstr_write_btree AS new_row
-WHERE id IN (1001, 1002)
+WHERE id BETWEEN 1001 AND 1009
 ORDER BY id;
 DROP TABLE clstr_write_btree;
 
@@ -128,13 +130,14 @@ SELECT g, CASE WHEN g <= 200 THEN 'a' ELSE 'b' END, repeat('x', 10)
 FROM generate_series(1, 400) AS g;
 CREATE INDEX clstr_write_text_overflow_k_id ON clstr_write_text_overflow (k, id);
 CLUSTER clstr_write_text_overflow USING clstr_write_text_overflow_k_id;
-INSERT INTO clstr_write_text_overflow VALUES (1001, 'a', repeat('y', 10));
-INSERT INTO clstr_write_text_overflow VALUES (1002, 'a', repeat('y', 10));
+INSERT INTO clstr_write_text_overflow
+SELECT 1000 + g, 'a', repeat('y', 10)
+FROM generate_series(1, 9) AS g;
 SELECT id, tid_block(new_row.ctid) <=
-	(SELECT max(tid_block(ctid)) FROM clstr_write_text_overflow WHERE k = 'a' AND id NOT IN (1001, 1002))
+	(SELECT max(tid_block(ctid)) FROM clstr_write_text_overflow WHERE k = 'a' AND id <= 400)
 	AS used_clustered_key_reserve
 FROM clstr_write_text_overflow AS new_row
-WHERE id IN (1001, 1002)
+WHERE id BETWEEN 1001 AND 1009
 ORDER BY id;
 DROP TABLE clstr_write_text_overflow;
 

@@ -62,19 +62,25 @@ wasted clustered-index work.  For single-row `INSERT ... SELECT` paths, the
 current page policy also requires clustered candidates to satisfy the normal
 insert target free-space threshold; when the equal-key neighborhood is below
 that threshold, the overflow run moves to the relation tail instead of
-consuming fillfactor reserve from many old pages.  On the scale `1`, hot `0.9`
-synthetic run, this reduced clustered `insert_hot` span to the control shape
-(`384` blocks at fillfactor `90`, `693` at fillfactor `50`) instead of the
-previous scattered spans (`3737` and `6596`).  The write-time cost is still
-visible: clustered inserts in that run were about `1.1-1.2s` versus `74-76 ms`
-for the no-cluster-metadata control.
+consuming fillfactor reserve from many old pages.  A later reserve-restoration
+pass deliberately allowed short equal-prefix runs to use a small number of
+below-fillfactor clustered neighbors before the overflow cache activates.  That
+keeps small grouped diffs local, but means the `insert_hot` span can still look
+large because a few hot rows remain in the old clustered range while the rest
+append at the tail.  The split `insert_hot`/`insert_rest` metrics make that
+tradeoff visible instead of hiding it in one aggregate.
 
 Set `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` to run the insert diff
 with an explicit `ORDER BY tile_id, osm_id`.  This is a diagnostic upper bound
-for "buffer and micro-sort before insert" ideas.  In the current hot synthetic
-shape it does not improve locality by itself, because the important decision is
-whether clustered insertion consumes old fillfactor reserve or starts a compact
-overflow run.
+for "buffer and micro-sort before insert" ideas.  A focused scale `1`, hot `0`
+run caught an important interaction: immediate overflow-cache activation after
+the first below-fillfactor hit made sorted non-hot input fast but wrong,
+dropping clustered insert locality from `83.97-100%` to `20.48%` inside the
+base range.  Delaying tail overflow until after a small number of reserve hits
+restored sorted locality to `84.75%` at fillfactor `90` and `100%` at
+fillfactor `50`.  In the current hot synthetic shape, ordering alone still does
+not make the forced hot rows local; it mainly checks whether a grouped input
+shape accidentally trips the overflow policy too early.
 
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
@@ -378,8 +384,10 @@ Do not repeat these paths blindly:
   still paid an index probe for every row in the same exhausted `tile_id`.
   Remembering the exhausted prefix and current tail block brought the scale `1`,
   hot `0.9` integer clustered insert from `1194.27 ms` / `1079.02 ms` at
-  fillfactor `90` / `50` to `70.85 ms` / `82.54 ms`, while preserving the
-  compact `insert_hot` spans (`384` / `693` blocks).
+  fillfactor `90` / `50` to `70.85 ms` / `82.54 ms`.  A later reserve
+  restoration allows a few below-fillfactor clustered neighbours before that
+  cache activates, so current hot spans are intentionally reported as a
+  tradeoff rather than as the old compact-span claim.
 * **By-reference clustered prefixes in the overflow cache:** fixed after the
   by-value cache left generated text keys on the slow path.  The first
   implementation copied varlena prefixes into separate `CacheMemoryContext`
@@ -405,6 +413,19 @@ Do not repeat these paths blindly:
   composite text fillfactor `90`, and from `317.57 ms` to `398.11 ms` for
   single text fillfactor `90`.  The raw focused run is under
   `/home/kom/tmp/clustered-write-synthetic/single-row-target-cache-focused-20260430-230337/`.
+* **Immediate tail overflow after the first below-fillfactor hit:** fixed after
+  `ORDER_DIFF_BY_CLUSTER_KEY_VALUES=true` exposed the failure mode.  Sorted
+  non-hot input groups the few rows for each key together; with immediate
+  overflow activation, those short groups were sent to the relation tail after
+  one reserve hit, dropping clustered insert locality to `20.48%` inside the
+  base range.  The kept policy counts a small number of reserve hits per
+  prefix before activating the cached tail target.  The focused scale `1`,
+  hot `0`, repeat `3` run restored sorted locality to `84.75%` at fillfactor
+  `90` and `100%` at fillfactor `50`, while the hot `0.9/1` regression run
+  kept write timings in the same broad range as the inline overflow-cache
+  sweep.  Invalid reserve-count entries are deliberately not updated when a
+  real overflow target extends, so an unrelated tail extension cannot
+  prematurely activate a counted-but-not-yet-overflowing prefix.
 
 The useful lesson from the rejected hot-prefix work is that duplicate-key
 batches need either a genuinely local page-selection policy for the repeated

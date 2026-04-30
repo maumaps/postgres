@@ -43,6 +43,7 @@
 #define CLUSTERED_WRITE_MAX_HEAP_BLOCKS		32
 #define CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES 32
 #define CLUSTERED_WRITE_OVERFLOW_VALUE_BYTES 1024
+#define CLUSTERED_WRITE_OVERFLOW_RESERVE_USES 8
 #define CLUSTERED_WRITE_CACHE_MAGIC			0x48435743	/* HCWC */
 
 typedef struct HeapClusteredWriteOverflowEntry
@@ -54,6 +55,7 @@ typedef struct HeapClusteredWriteOverflowEntry
 	Datum		overflowValue;
 	Size		overflowValueLen;
 	int16		overflowTypLen;
+	uint16		overflowReserveUses;
 	bool		overflowTypByVal;
 	BlockNumber overflowTargetBlock;
 	char		overflowValueStorage[CLUSTERED_WRITE_OVERFLOW_VALUE_BYTES];
@@ -100,6 +102,9 @@ static bool ClusteredWriteGetCachedOverflowTarget(Relation relation,
 static void ClusteredWriteRememberOverflowTarget(Relation relation,
 												 HeapTuple tuple,
 												 BlockNumber targetBlock);
+static void ClusteredWriteRememberReserveUse(Relation relation,
+											 HeapTuple tuple,
+											 BlockNumber targetBlock);
 static void ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
 													 BlockNumber targetBlock);
 static bool ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
@@ -689,8 +694,9 @@ ClusteredWriteGetCachedOverflowTarget(Relation relation, HeapTuple tuple,
 }
 
 static void
-ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
-									 BlockNumber targetBlock)
+ClusteredWriteRememberOverflowTargetInternal(Relation relation, HeapTuple tuple,
+											 BlockNumber targetBlock,
+											 bool countReserveUse)
 {
 	HeapClusteredWriteCache *cache;
 	Relation	indexRelation;
@@ -757,6 +763,7 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 	if (cache != NULL)
 	{
 		HeapClusteredWriteOverflowEntry *entry = NULL;
+		bool		matchedEntry = false;
 
 		for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
 		{
@@ -774,7 +781,10 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 													  entry->overflowValue,
 													  prefixValue));
 			if (equal)
+			{
+				matchedEntry = true;
 				break;
+			}
 			entry = NULL;
 		}
 
@@ -798,6 +808,8 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 				CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES;
 			entry = &cache->overflowEntries[insertAt];
 		}
+		if (!matchedEntry)
+			entry->overflowReserveUses = 0;
 
 		entry->overflowAttnum = attnum;
 		entry->overflowCollation = indexRelation->rd_indcollation[0];
@@ -809,11 +821,40 @@ ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
 			index_close(indexRelation, AccessShareLock);
 			return;
 		}
-		entry->overflowTargetBlock = targetBlock;
+		if (countReserveUse)
+		{
+			if (entry->overflowReserveUses < UINT16_MAX)
+				entry->overflowReserveUses++;
+			if (entry->overflowReserveUses < CLUSTERED_WRITE_OVERFLOW_RESERVE_USES)
+				entry->overflowTargetBlock = InvalidBlockNumber;
+			else
+				entry->overflowTargetBlock = targetBlock;
+		}
+		else
+		{
+			entry->overflowReserveUses = CLUSTERED_WRITE_OVERFLOW_RESERVE_USES;
+			entry->overflowTargetBlock = targetBlock;
+		}
 		entry->active = true;
 	}
 
 	index_close(indexRelation, AccessShareLock);
+}
+
+static void
+ClusteredWriteRememberOverflowTarget(Relation relation, HeapTuple tuple,
+									 BlockNumber targetBlock)
+{
+	ClusteredWriteRememberOverflowTargetInternal(relation, tuple, targetBlock,
+												 false);
+}
+
+static void
+ClusteredWriteRememberReserveUse(Relation relation, HeapTuple tuple,
+								 BlockNumber targetBlock)
+{
+	ClusteredWriteRememberOverflowTargetInternal(relation, tuple, targetBlock,
+												 true);
 }
 
 static void
@@ -829,7 +870,8 @@ ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
 
 	for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
 	{
-		if (cache->overflowEntries[i].active)
+		if (cache->overflowEntries[i].active &&
+			BlockNumberIsValid(cache->overflowEntries[i].overflowTargetBlock))
 			cache->overflowEntries[i].overflowTargetBlock = targetBlock;
 	}
 }
@@ -1579,15 +1621,15 @@ loop:
 				BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
 
 				/*
-				 * Let a clustered write use one below-fillfactor neighbor,
-				 * then redirect more equal-prefix overflow to the relation
-				 * tail.  This keeps rare keys near their cluster without
+				 * Let clustered writes use a small number of below-fillfactor
+				 * neighbors before redirecting equal-prefix overflow to the
+				 * relation tail.  That keeps short grouped diffs local without
 				 * spraying long duplicate-key runs through reserve space.
 				 */
 				RelationSetTargetBlock(relation, InvalidBlockNumber);
 				if (tuple != NULL && nblocks > 0)
-					ClusteredWriteRememberOverflowTarget(relation, tuple,
-														 nblocks - 1);
+					ClusteredWriteRememberReserveUse(relation, tuple,
+													 nblocks - 1);
 			}
 			return buffer;
 		}
