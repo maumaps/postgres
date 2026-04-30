@@ -206,6 +206,14 @@ cost or every ordered-input timing case.  Raw gzip output is under
 and
 `/home/kom/tmp/clustered-write-synthetic/copy-boundary-text-focused-20260501-021405/`.
 
+After `analyze`, the synthetic workload also records
+`clustered_write_read_hot` and `without_cluster_metadata_read_hot`.  These
+steps materialize a simple indexed read over the configured hot tile range:
+integer-key runs filter by `tile_id`, while generated text-key runs filter by
+the stored `cluster_key`.  This keeps read cost visible next to write cost when
+testing micro-sort or overflow-placement ideas; locality summaries alone cannot
+show whether a more compact tail is actually worth extra insert work.
+
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 `locality.tsv`, `timing_summary.tsv`, and `locality_summary.tsv`.  This is the
@@ -720,6 +728,24 @@ Do not repeat these paths blindly:
   and `tmp_install` was rebuilt from the clean branch.  The gzipped raw run is
   under
   `/home/kom/tmp/clustered-write-synthetic/prefix-threshold4-multi-hot-128-copy-20260501-034550/`.
+* **Btree leading-key sorting for skipped too-hot COPY prefixes:** rejected
+  for now.  The prototype left valid clustered target blocks alone, but used
+  btree sort support to order only the tuples whose clustered target probe had
+  already been skipped as too-hot.  It made the unordered multi-hot tail more
+  compact in the scale `1`, repeat `3`, `hot_tile_count=128` COPY run
+  (`insert_hot` outside-base span `392` blocks, `insert_rest` `113`), and the
+  new read step showed a possible unordered read win (`12.92 ms` prototype
+  median versus `15.70 ms` in a clean-code rerun).  However, the same prototype
+  added qsort/sortsupport work to the hot COPY path, did not beat the earlier
+  clean write baseline for unordered inserts (`157.76 ms` versus `140.79 ms`),
+  and the clean rerun was noisy enough that this needs a better read/write
+  benchmark shape before carrying more heap comparator complexity.  The code
+  experiment was reverted; the read timing benchmark was kept.  Raw gzip
+  outputs are under
+  `/home/kom/tmp/clustered-write-synthetic/btree-prefix-sort-read-ab-proto-20260501-035531/`,
+  `/home/kom/tmp/clustered-write-synthetic/btree-prefix-sort-read-ab-clean-20260501-035714/`,
+  and
+  `/home/kom/tmp/clustered-write-synthetic/multi-hot-128-ordered-copy-20260501-034338/`.
 * **Relying on ordered diff input as the non-hot cost fix:** rejected as a
   standalone answer.  A scale `1`, repeat `3`, single-key `hot=0` run with
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` kept the same locality shape
