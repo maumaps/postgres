@@ -25,6 +25,11 @@
 \set hot_tile_fraction 0
 \endif
 
+\if :{?heap_fillfactor}
+\else
+\set heap_fillfactor 90
+\endif
+
 \timing on
 
 drop table if exists clustered_write_osm_diff cascade;
@@ -39,6 +44,7 @@ select (200000 * :scale)::int as base_rows,
        (:'use_brin')::boolean as brin_enabled,
        (:'single_key_cluster')::boolean as single_key_cluster,
        (:'text_cluster_key')::boolean as text_cluster_key,
+       (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction;
 
 create unlogged table clustered_write_osm_diff_on
@@ -48,7 +54,7 @@ create unlogged table clustered_write_osm_diff_on
     cluster_key text collate "C" generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
     version int not null,
     payload text not null
-) with (fillfactor = 90);
+) with (fillfactor = :heap_fillfactor);
 
 insert into clustered_write_osm_diff_on (osm_id, tile_id, version, payload)
 select g,
@@ -91,7 +97,7 @@ create unlogged table clustered_write_osm_diff_off
     cluster_key text collate "C" generated always as ('g' || lpad(tile_id::text, 8, '0')) stored,
     version int not null,
     payload text not null
-) with (fillfactor = 90);
+) with (fillfactor = :heap_fillfactor);
 
 insert into clustered_write_osm_diff_off (osm_id, tile_id, version, payload)
 select osm_id,
@@ -152,6 +158,7 @@ select (200000 * :scale)::int as base_rows,
        (:'use_brin')::boolean as brin_enabled,
        (:'single_key_cluster')::boolean as single_key_cluster,
        (:'text_cluster_key')::boolean as text_cluster_key,
+       (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction;
 
 create temp table clustered_write_step_timings
@@ -252,6 +259,7 @@ analyze clustered_write_osm_diff_off;
 
 select s.brin_enabled,
        s.text_cluster_key,
+       s.heap_fillfactor,
        t.step,
        round((extract(epoch from t.finished_at - t.started_at) * 1000)::numeric, 2) as elapsed_ms
 from clustered_write_step_timings as t
@@ -342,6 +350,7 @@ drift as
 )
 select s.brin_enabled,
        s.text_cluster_key,
+       s.heap_fillfactor,
        variant,
        diff_kind,
        count(*) as rows_measured,
@@ -352,5 +361,5 @@ select s.brin_enabled,
        max(block_drift) as max_block_drift
 from drift
 join clustered_write_settings as s on true
-group by s.brin_enabled, s.text_cluster_key, variant, diff_kind
-order by s.brin_enabled, s.text_cluster_key, variant, diff_kind;
+group by s.brin_enabled, s.text_cluster_key, s.heap_fillfactor, variant, diff_kind
+order by s.brin_enabled, s.text_cluster_key, s.heap_fillfactor, variant, diff_kind;
