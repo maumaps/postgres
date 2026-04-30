@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 
 DBNAME=${DBNAME:-postgres}
 PSQL=${PSQL:-psql}
@@ -22,6 +23,37 @@ COMPRESS_RAW=${COMPRESS_RAW:-true}
 KEEP_TEMP_INSTANCE_DATA=${KEEP_TEMP_INSTANCE_DATA:-false}
 
 mkdir -p "$OUTDIR/raw"
+
+{
+	printf 'date: '
+	date -Is
+	printf 'script_dir: %s\n' "$SCRIPT_DIR"
+	printf 'repo_root: %s\n' "$REPO_ROOT"
+	if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		printf 'git_head: %s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)"
+		printf 'git_branch: %s\n' "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+	fi
+	printf 'dbname: %s\n' "$DBNAME"
+	printf 'pg_bindir: %s\n' "$PG_BINDIR"
+	printf 'use_temp_instance: %s\n' "$USE_TEMP_INSTANCE"
+	printf 'pgport: %s\n' "$PGPORT"
+	printf 'pg_opts: %s\n' "$PG_OPTS"
+	printf 'repeats: %s\n' "$REPEATS"
+	printf 'scale_values: %s\n' "$SCALE_VALUES"
+	printf 'brin_values: %s\n' "$BRIN_VALUES"
+	printf 'single_key_values: %s\n' "$SINGLE_KEY_VALUES"
+	printf 'text_key_values: %s\n' "$TEXT_KEY_VALUES"
+	printf 'hot_tile_fraction_values: %s\n' "$HOT_TILE_FRACTION_VALUES"
+	printf 'heap_fillfactor_values: %s\n' "$HEAP_FILLFACTOR_VALUES"
+	printf 'order_diff_by_cluster_key_values: %s\n' "$ORDER_DIFF_BY_CLUSTER_KEY_VALUES"
+	printf 'compress_raw: %s\n' "$COMPRESS_RAW"
+	printf 'keep_temp_instance_data: %s\n' "$KEEP_TEMP_INSTANCE_DATA"
+	printf 'uname: '
+	uname -a
+	printf 'uptime: '
+	uptime
+	df -h "$OUTDIR" "${TMPDIR:-/tmp}" 2>/dev/null || true
+} >"$OUTDIR/run_environment.txt"
 
 if [[ "$USE_TEMP_INSTANCE" == "true" ]]; then
 	if [[ -z "$PG_BINDIR" ]]; then

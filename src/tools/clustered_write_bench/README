@@ -95,6 +95,9 @@ the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 preferred way to compare small hot-path changes because single runs can be
 noisy even with `fsync=off`.  It also writes `server_version.txt`; check that
 file before comparing runs that were not started with `USE_TEMP_INSTANCE=true`.
+Each run also writes `run_environment.txt` with the git head, benchmark
+settings, uptime/load, filesystem space, and selected PostgreSQL bindir, so
+noisy timing comparisons can be traced back to the build and host state.
 `locality.tsv` reports `heap_blocks_touched`, `heap_block_span`, and
 `outside_base_heap_block_span`.  The full span is useful for duplicate-key
 overflow experiments, but it can overstate a mixed shape where a few rows still
