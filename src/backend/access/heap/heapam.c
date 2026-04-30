@@ -127,6 +127,8 @@ static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 static int	heap_clustered_write_item_cmp(const void *a, const void *b, void *arg);
 static bool heap_clustered_write_prefix_can_compare_all_equal(Oid typeOid);
 static bool heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid);
+static bool heap_clustered_write_prefix_can_hash(Oid typeOid);
+static uint32 heap_clustered_write_prefix_hash(Datum value, Oid typeOid);
 static bool heap_clustered_write_index_can_sort(Relation relation,
 												Relation indexRelation);
 static int	heap_prepare_clustered_write_sort(Relation relation,
@@ -268,6 +270,51 @@ heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid)
 			return true;
 		default:
 			return false;
+	}
+}
+
+static bool
+heap_clustered_write_prefix_can_hash(Oid typeOid)
+{
+	if (get_typbyval(typeOid))
+		return true;
+
+	switch (typeOid)
+	{
+		case TEXTOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint32
+heap_clustered_write_prefix_hash(Datum value, Oid typeOid)
+{
+	if (get_typbyval(typeOid))
+		return hash_bytes((unsigned char *) &value, sizeof(Datum));
+
+	switch (typeOid)
+	{
+		case TEXTOID:
+			{
+				struct varlena *text = (struct varlena *)
+					PG_DETOAST_DATUM_PACKED(value);
+				uint32		hash;
+
+				/*
+				 * This hash only selects a direct-mapped cache slot.  Callers
+				 * still verify hits with the clustered index equality operator,
+				 * so different payloads can only cause cache misses or evictions.
+				 */
+				hash = hash_bytes((unsigned char *) VARDATA_ANY(text),
+								  VARSIZE_ANY_EXHDR(text));
+				if ((Pointer) text != DatumGetPointer(value))
+					pfree(text);
+				return hash;
+			}
+		default:
+			pg_unreachable();
 	}
 }
 
@@ -2794,7 +2841,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 											 ntuples *
 											 CLUSTERED_WRITE_PREFIX_TARGET_HASH_FACTOR));
 					usePrefixHashCache =
-						get_typbyval(clusteredIndexRelation->rd_opcintype[0]);
+						heap_clustered_write_prefix_can_hash(
+							clusteredIndexRelation->rd_opcintype[0]);
 
 					if (!usePrefixHashCache)
 						prefixTargetCacheLimit = ntuples;
@@ -2834,8 +2882,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 						{
 							uint32		prefixHash;
 
-							prefixHash = hash_bytes((unsigned char *) &prefixValue,
-													sizeof(Datum));
+							prefixHash =
+								heap_clustered_write_prefix_hash(prefixValue,
+																 clusteredIndexRelation->rd_opcintype[0]);
 							prefixCacheSlot =
 								prefixHash & prefixTargetCacheMask;
 							ncacheEntries =
@@ -2973,8 +3022,9 @@ skip_clustered_prefix_cache:
 								{
 									uint32		prefixHash;
 
-									prefixHash = hash_bytes((unsigned char *) &prefixValue,
-															sizeof(Datum));
+									prefixHash =
+										heap_clustered_write_prefix_hash(prefixValue,
+																		 clusteredIndexRelation->rd_opcintype[0]);
 									prefixCacheSlot =
 										prefixHash & prefixTargetCacheMask;
 									ncacheEntries =

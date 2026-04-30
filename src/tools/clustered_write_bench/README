@@ -447,6 +447,23 @@ Do not repeat these paths blindly:
   the same (`line 4/2362.25`, `point 4/1097`, `polygon 9/1289` p95
   blocks/span).  Exact polygon reads were faster in that single run, but the
   write path got worse, so the code change was reverted.
+* **Normalized text-payload hashing for clustered COPY prefix caches:** fixed
+  after the safer page-boundary guard exposed the generated-text COPY cost.
+  Unlike the rejected `datum_image_hash()` prototype, this path hashes only
+  normalized `text` payload bytes (`VARDATA_ANY` / `VARSIZE_ANY_EXHDR`) and
+  uses the hash only to choose a direct-mapped cache slot; every cache hit is
+  still verified by the clustered index equality operator.  In the focused
+  scale `1`, repeat `3`, generated text-key COPY run, median clustered COPY
+  insert time fell from `1040.17 ms` to `435.25 ms` at fillfactor `50`
+  unordered, from `400.92 ms` to `275.26 ms` at fillfactor `50` ordered, from
+  `853.26 ms` to `455.36 ms` at fillfactor `90` unordered, and from
+  `507.18 ms` to `366.62 ms` at fillfactor `90` ordered.  Locality stayed at
+  `100.00%` inside the base range for fillfactor `50` and `83.97%` /
+  `84.75%` for unordered / ordered fillfactor `90`.  The raw runs are
+  `/home/kom/tmp/clustered-write-synthetic/copy-boundary-text-focused-20260501-021405/`
+  before the fix and
+  `/home/kom/tmp/clustered-write-synthetic/text-prefix-payload-hash-focused-20260501-022213/`
+  after it.
 * **One-opened-index-per-`heap_multi_insert` batch as a simplification:** kept
   out as a performance change because the single Georgia rerun did not beat
   the prior generated-geohash result (`1:59.29` create, `1:56.57` append).
