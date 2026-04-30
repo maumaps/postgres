@@ -10,6 +10,11 @@
 \set use_brin false
 \endif
 
+\if :{?single_key_cluster}
+\else
+\set single_key_cluster false
+\endif
+
 \timing on
 
 drop table if exists clustered_write_osm_diff cascade;
@@ -21,7 +26,8 @@ select (200000 * :scale)::int as base_rows,
        (20000 * :scale)::int as insert_rows,
        (20000 * :scale)::int as update_rows,
        (4096 * :scale)::int as tile_count,
-       (:'use_brin')::boolean as brin_enabled;
+       (:'use_brin')::boolean as brin_enabled,
+       (:'single_key_cluster')::boolean as single_key_cluster;
 
 create unlogged table clustered_write_osm_diff_on
 (
@@ -39,8 +45,13 @@ select g,
 from clustered_write_settings as s,
      generate_series(1, s.base_rows) as g;
 
+\if :single_key_cluster
+create index clustered_write_osm_diff_tile_idx
+    on clustered_write_osm_diff_on (tile_id);
+\else
 create index clustered_write_osm_diff_tile_idx
     on clustered_write_osm_diff_on (tile_id, osm_id);
+\endif
 
 \if :use_brin
 create index clustered_write_osm_diff_tile_brin_idx
@@ -62,8 +73,13 @@ insert into clustered_write_osm_diff_off
 select *
 from clustered_write_osm_diff_on;
 
+\if :single_key_cluster
+create index clustered_write_osm_diff_off_tile_idx
+    on clustered_write_osm_diff_off (tile_id);
+\else
 create index clustered_write_osm_diff_off_tile_idx
     on clustered_write_osm_diff_off (tile_id, osm_id);
+\endif
 
 \if :use_brin
 create index clustered_write_osm_diff_off_tile_brin_idx
@@ -96,7 +112,8 @@ select (200000 * :scale)::int as base_rows,
        (20000 * :scale)::int as insert_rows,
        (20000 * :scale)::int as update_rows,
        (4096 * :scale)::int as tile_count,
-       (:'use_brin')::boolean as brin_enabled;
+       (:'use_brin')::boolean as brin_enabled,
+       (:'single_key_cluster')::boolean as single_key_cluster;
 
 create temp table clustered_write_step_timings
 (

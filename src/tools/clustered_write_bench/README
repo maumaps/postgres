@@ -20,6 +20,11 @@ under test, the wrapper can create and stop a temporary instance itself:
         REPEATS=3 SCALE_VALUES=1 BRIN_VALUES=false \
         src/tools/clustered_write_bench/run_synthetic_bench.sh
 
+Set `SINGLE_KEY_VALUES="false true"` to run both clustered index shapes:
+`false` uses the composite `(tile_id, osm_id)` key that stresses left-prefix
+placement for new object ids, while `true` uses a single-column `(tile_id)` key
+closer to the experimental osm2pgsql generated-geohash index.
+
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
 `locality.tsv`, `timing_summary.tsv`, and `locality_summary.tsv`.  This is the
@@ -119,6 +124,8 @@ Important output columns:
 * `brin_enabled`: whether the optional BRIN index was present for this run.
   Current placement does not consume BRIN directly, so this should normally
   leave the locality metrics unchanged until a BRIN/range path is implemented.
+* `single_key_cluster`: whether the remembered clustered btree index was on
+  just the tile key instead of `(tile_id, osm_id)`.
 * `variant`: either the clustered-write path or the in-script control without
   remembered clustered-index metadata.
 * `step` and `elapsed_ms`: structured timing rows for the diff insert/update

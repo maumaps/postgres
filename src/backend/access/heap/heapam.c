@@ -2592,14 +2592,15 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		if (use_clustered_target_probe || use_clustered_sort)
 		{
 			/*
-			 * Composite clustered indexes commonly group many batch tuples by
-			 * the leading key, while the trailing key is a new object id.  A
-			 * small per-batch cache avoids repeating the same anchored prefix
-			 * probe for every tuple in that group.  The equality function may
-			 * detoast or allocate, so comparisons run in a resettable context.
+			 * Clustered btree indexes commonly group many batch tuples by
+			 * their leading key.  For single-column indexes this is the exact
+			 * clustered key; for composite indexes the trailing key can be a
+			 * new object id.  A small per-batch cache avoids repeating the same
+			 * anchored probe for every tuple in that group.  The equality
+			 * function may detoast or allocate, so comparisons run in a
+			 * resettable context.
 			 */
-			if (use_clustered_target_probe &&
-				clusteredIndexRelation->rd_index->indnkeyatts > 1)
+			if (use_clustered_target_probe)
 			{
 				Oid			eqOperator;
 
