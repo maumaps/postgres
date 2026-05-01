@@ -386,6 +386,62 @@ update clustered_write_step_timings
 set finished_at = clock_timestamp()
 where step = 'without_cluster_metadata_read_hot';
 
+insert into clustered_write_step_timings
+values ('clustered_write_read_updated_hot', clock_timestamp(), null);
+
+\if :text_cluster_key
+create temp table clustered_write_read_updated_hot_on as
+select count(*) as rows_read,
+       sum(length(o.payload)) as payload_bytes
+from clustered_write_osm_diff_on as o
+join clustered_write_settings as s on true
+where o.version > 1
+  and o.cluster_key in (
+    select 'g' || lpad(g::text, 8, '0')
+    from generate_series(1, s.hot_tile_count) as g
+);
+\else
+create temp table clustered_write_read_updated_hot_on as
+select count(*) as rows_read,
+       sum(length(o.payload)) as payload_bytes
+from clustered_write_osm_diff_on as o
+join clustered_write_settings as s on true
+where o.version > 1
+  and o.tile_id between 1 and s.hot_tile_count;
+\endif
+
+update clustered_write_step_timings
+set finished_at = clock_timestamp()
+where step = 'clustered_write_read_updated_hot';
+
+insert into clustered_write_step_timings
+values ('without_cluster_metadata_read_updated_hot', clock_timestamp(), null);
+
+\if :text_cluster_key
+create temp table clustered_write_read_updated_hot_off as
+select count(*) as rows_read,
+       sum(length(o.payload)) as payload_bytes
+from clustered_write_osm_diff_off as o
+join clustered_write_settings as s on true
+where o.version > 1
+  and o.cluster_key in (
+    select 'g' || lpad(g::text, 8, '0')
+    from generate_series(1, s.hot_tile_count) as g
+);
+\else
+create temp table clustered_write_read_updated_hot_off as
+select count(*) as rows_read,
+       sum(length(o.payload)) as payload_bytes
+from clustered_write_osm_diff_off as o
+join clustered_write_settings as s on true
+where o.version > 1
+  and o.tile_id between 1 and s.hot_tile_count;
+\endif
+
+update clustered_write_step_timings
+set finished_at = clock_timestamp()
+where step = 'without_cluster_metadata_read_updated_hot';
+
 select s.brin_enabled,
        s.text_cluster_key,
        s.heap_fillfactor,

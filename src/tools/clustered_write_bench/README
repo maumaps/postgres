@@ -213,6 +213,10 @@ integer-key runs filter by `tile_id`, while generated text-key runs filter by
 the stored `cluster_key`.  This keeps read cost visible next to write cost when
 testing micro-sort or overflow-placement ideas; locality summaries alone cannot
 show whether a more compact tail is actually worth extra insert work.
+The companion `clustered_write_read_updated_hot` and
+`without_cluster_metadata_read_updated_hot` steps apply the same hot-range
+read shape to rows whose diff update bumped `version`, making moved-update
+read cost visible separately from the broader hot-tile read.
 
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
@@ -746,6 +750,20 @@ Do not repeat these paths blindly:
   `/home/kom/tmp/clustered-write-synthetic/btree-prefix-sort-read-ab-clean-20260501-035714/`,
   and
   `/home/kom/tmp/clustered-write-synthetic/multi-hot-128-ordered-copy-20260501-034338/`.
+* **Using clustered target selection for moved heap updates:** rejected for
+  now.  The prototype passed the updated tuple from `heap_update()` into
+  `RelationGetBufferForTuple()` and allowed the existing clustered neighbor
+  search when `otherBuffer` was set, relying on the existing lower-block-first
+  buffer lock ordering.  A scale `1`, repeat `3`, `hot_tile_fraction=0.9`,
+  `hot_tile_count=128` run did not improve the meaningful locality shape:
+  `pct_inside_base_range` stayed at `7.41/7.91%` for unordered/ordered
+  clustered updates, while update write cost regressed badly.  Clustered update
+  medians rose to `1191.28 ms` unordered and `1072.18 ms` ordered, versus the
+  in-script control at `784.22 ms` and `889.52 ms`.  The new
+  `read_updated_hot` step also showed no decisive read win (`37.64/39.88 ms`
+  clustered versus `39.05/35.88 ms` control).  The code experiment was
+  reverted; the update-focused read timing was kept.  Raw gzip output is under
+  `/home/kom/tmp/clustered-write-synthetic/update-placement-proto-20260501-040654/`.
 * **Relying on ordered diff input as the non-hot cost fix:** rejected as a
   standalone answer.  A scale `1`, repeat `3`, single-key `hot=0` run with
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` kept the same locality shape

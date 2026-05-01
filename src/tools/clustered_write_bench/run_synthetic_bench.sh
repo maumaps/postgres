@@ -151,9 +151,11 @@ SQL
 										'$5 == "clustered_write_insert" ||
 										 $5 == "clustered_write_update" ||
 										 $5 == "clustered_write_read_hot" ||
+										 $5 == "clustered_write_read_updated_hot" ||
 										 $5 == "without_cluster_metadata_insert" ||
 										 $5 == "without_cluster_metadata_update" ||
-										 $5 == "without_cluster_metadata_read_hot" {
+										 $5 == "without_cluster_metadata_read_hot" ||
+										 $5 == "without_cluster_metadata_read_updated_hot" {
 											printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 												run, scale, brin, single_key, text_cluster_key, heap_fillfactor, hot_tile_fraction, hot_tile_count, order_diff_by_cluster_key, copy_diff_from_file, $5, $6
 										}' "$raw" >>"$timings_tsv"
