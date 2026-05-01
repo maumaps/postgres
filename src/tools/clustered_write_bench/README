@@ -390,6 +390,9 @@ Useful overrides:
 * `OSM2PGSQL_STYLE=/path/to/default.style` selects the pgsql style file.
 * `OSC_URL=https://...osc.gz` pins a specific planet daily diff.
 * `BENCH_VARIANTS=baseline_stock,patched_stock` runs only selected variants.
+* `READ_REPEATS=3` runs the read benchmark several times against the same
+  imported database.  This is much cheaper than repeating the full import and
+  makes cache/scheduler outliers visible in the read numbers.
 * `COMPRESS_LOGS=false` leaves per-variant logs uncompressed.
 * `KEEP_PGDATA=true` keeps finished or failed PostgreSQL data directories for
   manual inspection.  The default is to delete them; use a fresh `$WORKDIR` for
@@ -541,6 +544,23 @@ host-load-sensitive run.  This repeat also verified the real-workload harness
 cleanup path: per-variant logs were gzip-compressed and `pgdata` was removed
 with `KEEP_PGDATA=false`.  Raw gzip logs and `run_environment.txt` are under
 `/home/kom/tmp/clustered-write-osm2pgsql-staged-delete-index-rerun-20260501-155455/`.
+
+Adding `READ_REPEATS=3` made the read comparison less dependent on one cold
+query pass.  A same-input patched PostgreSQL run compared stock osm2pgsql with
+the staged clustered import while keeping the generated `pgdata` cleanup and
+gzip compression enabled:
+
+| variant | create elapsed | append elapsed | size | point bbox median | line bbox median | polygon bbox median | roads exact median | polygon exact median | locality summary median | p95 block/span |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| patched_stock | 1:47.47 | 2:20.95 | 2728 MB | 130.545 ms | 193.198 ms | 330.994 ms | 76.100 ms | 1852.406 ms | 8123.631 ms | line 7/2381, point 6/1002, polygon 32/1208 |
+| patched_clustered_import | 1:21.41 | 3:05.01 | 2841 MB | 110.095 ms | 200.126 ms | 345.462 ms | 46.813 ms | 1695.422 ms | 6832.766 ms | line 2/2, point 2/1, polygon 3/2 |
+
+This is a useful but mixed result: the clustered import is faster to create,
+has far tighter heap locality, and improves point bbox plus exact reads in the
+warm median; line/polygon bbox are roughly tied or slightly worse, and append
+is still slower in this run.  Raw gzip logs are under
+`/home/kom/tmp/clustered-write-osm2pgsql-read-repeats-20260501-160342/` and
+`/home/kom/tmp/clustered-write-osm2pgsql-stock-read-repeats-20260501-160927/`.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql

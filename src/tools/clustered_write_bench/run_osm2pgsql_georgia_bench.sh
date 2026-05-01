@@ -23,6 +23,7 @@ PG_PORT_BASE="${PG_PORT_BASE:-55432}"
 OSM2PGSQL_CACHE_MB="${OSM2PGSQL_CACHE_MB:-2048}"
 OSM2PGSQL_PROCS="${OSM2PGSQL_PROCS:-4}"
 BENCH_VARIANTS="${BENCH_VARIANTS:-baseline_stock,patched_stock,patched_clustered_import}"
+READ_REPEATS="${READ_REPEATS:-1}"
 COMPRESS_LOGS="${COMPRESS_LOGS:-true}"
 KEEP_PGDATA="${KEEP_PGDATA:-false}"
 
@@ -246,6 +247,29 @@ run_psql()
     "$pg_bin/psql" -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$port" -d "$db" "$@"
 }
 
+run_read_benchmarks()
+{
+    local name="$1"
+    local pg_bin="$2"
+    local port="$3"
+    local read_run
+    local out_prefix
+
+    for read_run in $(seq 1 "$READ_REPEATS"); do
+        if [[ "$READ_REPEATS" == "1" ]]; then
+            out_prefix="$WORKDIR/logs/$name-read"
+        else
+            out_prefix="$WORKDIR/logs/$name-read-run-$read_run"
+        fi
+
+        log "read benchmark for $name ($read_run/$READ_REPEATS)"
+        run_psql "$pg_bin" "$port" osm \
+            -f "$BENCH_DIR/osm2pgsql_georgia_read.sql" \
+            >"$out_prefix.sqlout" \
+            2>"$out_prefix.sqlerr"
+    done
+}
+
 run_variant()
 {
     local name="$1"
@@ -301,11 +325,7 @@ run_variant()
         >"$WORKDIR/logs/$name-append.stdout" \
         2>"$WORKDIR/logs/$name-append.stderr"
 
-    log "read benchmark for $name"
-    run_psql "$pg_bin" "$port" osm \
-        -f "$BENCH_DIR/osm2pgsql_georgia_read.sql" \
-        >"$WORKDIR/logs/$name-read.sqlout" \
-        2>"$WORKDIR/logs/$name-read.sqlerr"
+    run_read_benchmarks "$name" "$pg_bin" "$port"
 
     run_psql "$pg_bin" "$port" osm \
         -c "select current_database() as db, pg_size_pretty(pg_database_size(current_database())) as database_size;" \
@@ -342,6 +362,7 @@ write_run_environment()
         printf 'osm2pgsql_cache_mb: %s\n' "$OSM2PGSQL_CACHE_MB"
         printf 'osm2pgsql_procs: %s\n' "$OSM2PGSQL_PROCS"
         printf 'bench_variants: %s\n' "$BENCH_VARIANTS"
+        printf 'read_repeats: %s\n' "$READ_REPEATS"
         printf 'compress_logs: %s\n' "$COMPRESS_LOGS"
         printf 'keep_pgdata: %s\n' "$KEEP_PGDATA"
         printf 'uname: '
@@ -388,6 +409,7 @@ log "  daily_diff=$daily_diff_url"
 log "  simplified_daily_diff=$simplified_daily_diff"
 log "  variants=$BENCH_VARIANTS"
 log "  workdir=$WORKDIR"
+log "  read_repeats=$READ_REPEATS"
 log "  compress_logs=$COMPRESS_LOGS"
 log "  keep_pgdata=$KEEP_PGDATA"
 
