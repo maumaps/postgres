@@ -227,7 +227,7 @@ index 6b250a6..4b38667 100644
  }
 
 diff --git a/src/table.cpp b/src/table.cpp
-index 6b65eb9..9e3b095 100644
+index 6b65eb9..67bf1cf 100644
 --- a/src/table.cpp
 +++ b/src/table.cpp
 @@ -27,10 +27,11 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
@@ -266,7 +266,7 @@ index 6b65eb9..9e3b095 100644
    m_hstore_columns(other.m_hstore_columns), m_table_space(other.m_table_space),
    m_copy(copy_thread)
  {
-@@ -118,18 +126,52 @@ void table_t::start(connection_params_t const &connection_params,
+@@ -118,12 +126,28 @@ void table_t::start(connection_params_t const &connection_params,
              sql += "\"tags\" hstore,";
          }
 
@@ -298,31 +298,7 @@ index 6b65eb9..9e3b095 100644
          //add the main table space
          sql += m_table_space;
 
-         //create the table
-         m_db_connection->exec(sql);
-
-+        if (m_cluster_during_import) {
-+            auto const idx_name = m_target->name() + "_cluster_key_idx";
-+            auto const quoted_idx_name = fmt::format(R"("{}")", idx_name);
-+
-+            check_identifier(idx_name, "index names");
-+            log_info("Creating clustered geometry key index on table '{}'...",
-+                     m_target->name());
-+            m_db_connection->exec(
-+                "CREATE INDEX {} ON {} USING BTREE "
-+                "(osm2pgsql_cluster_key) {}",
-+                quoted_idx_name, qual_name, tablespace_clause(table_space));
-+
-+            log_info("Remembering clustered geometry key order for table '{}'...",
-+                     m_target->name());
-+            m_db_connection->exec("CLUSTER {} USING {}", qual_name,
-+                                  quoted_idx_name);
-+        }
-+
-         if (m_srid != "4326") {
-             create_geom_check_trigger(*m_db_connection, m_target->schema(),
-                                       m_target->name(), "ST_IsValid(NEW.way)");
-@@ -190,17 +232,22 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
+@@ -190,17 +214,38 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
                                      m_target->name());
          }
 
@@ -330,22 +306,38 @@ index 6b65eb9..9e3b095 100644
 +        if (m_cluster_during_import) {
 +            log_info("Keeping ordered staged COPY heap for table '{}'.",
 +                     m_target->name());
-+        } else {
-+            log_info("Clustering table '{}' by geometry...", m_target->name());
++            auto const idx_name = m_target->name() + "_cluster_key_idx";
++            auto const quoted_idx_name = fmt::format(R"("{}")", idx_name);
 
 -        std::string const sql =
 -            fmt::format("CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
 -                        qual_tmp_name, m_table_space, qual_name);
-+            std::string const sql = fmt::format(
-+                "CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
-+                qual_tmp_name, m_table_space, qual_name);
++            check_identifier(idx_name, "index names");
++            log_info("Creating clustered geometry key index on table '{}'...",
++                     m_target->name());
++            m_db_connection->exec(
++                "CREATE INDEX {} ON {} USING BTREE "
++                "(osm2pgsql_cluster_key) {}",
++                quoted_idx_name, qual_name,
++                tablespace_clause(table_space_index));
 
 -        m_db_connection->exec(sql);
-+            m_db_connection->exec(sql);
++            log_info("Remembering clustered geometry key order for table '{}'...",
++                     m_target->name());
++            m_db_connection->exec("CLUSTER {} USING {}", qual_name,
++                                  quoted_idx_name);
++        } else {
++            log_info("Clustering table '{}' by geometry...", m_target->name());
 
 -        m_db_connection->exec("DROP TABLE {}", qual_name);
 -        m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")", qual_tmp_name,
 -                              m_target->name());
++            std::string const sql = fmt::format(
++                "CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
++                qual_tmp_name, m_table_space, qual_name);
++
++            m_db_connection->exec(sql);
++
 +            m_db_connection->exec("DROP TABLE {}", qual_name);
 +            m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")",
 +                                  qual_tmp_name, m_target->name());

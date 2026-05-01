@@ -476,14 +476,34 @@ were tested before this point and rejected: they lowered or raised initial
 import time depending on the window, but left `osm2pgsql_cluster_key`
 correlation poor and made diff append much slower.
 
+The next kept staging improvement defers the clustered btree index until after
+the initial staged drain.  The initial load does not need that index while rows
+are already draining in generated-key order; it is only needed afterwards so
+future append runs remember the clustered order.  On the same Georgia + planet
+daily diff `978` setup this measured `2:10.01` create, `2:45.90` append, and
+`2837 MB` database size.  Read timings were `190.026 ms` point bbox,
+`666.042 ms` line bbox, `1106.330 ms` polygon bbox, `1890.598 ms` roads exact,
+and `1976.231 ms` polygon exact.  Locality stayed in the same compact-block
+shape with p95 block/span `3/2367.75` line, `3/1024` point, and `3/1643`
+polygon; generated-key correlations stayed mixed (`line=0.4716`,
+`point=-0.0678`, `polygon=-0.5425`, `roads=0.4918`).  This is enough to keep
+the deferred-index change in the osm2pgsql experiment: it removes obvious
+btree-maintenance cost from initial import, improves bbox reads and polygon
+exact reads versus the previous staged run, but regresses roads exact.  It still
+does not beat the earlier
+generated-preserving rewrite target on write time, so the open problem remains
+the append/drain cost rather than correctness or heap compactness.  Raw gzip
+logs are under
+`/home/kom/tmp/clustered-write-osm2pgsql-ordered-deferred-index-20260501-143958/`.
+
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
 checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
 adds `--cluster-during-import`, creates a generated geometry-derived geohash key
-and a clustered btree index before the first COPY, creates the heap with
-`fillfactor=90`, stages COPY rows in per-target temporary tables, and drains
-those staged rows ordered by the generated key before final index creation or
-diff append.
+and a heap with `fillfactor=90`, stages COPY rows in per-target temporary
+tables, drains those staged rows ordered by the generated key, then creates and
+marks the clustered btree index before final GiST/osm_id index creation.  Append
+runs keep using the existing generated-key clustered index.
 
 Directly clustering the import tables with a pre-COPY GiST index on `way` was
 also tested as a negative control.  It worked functionally, but maintaining the
