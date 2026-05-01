@@ -161,6 +161,21 @@ regressions (`850.61 ms` to `917.17 ms` for integer fillfactor `50`,
 `738.09 ms` to `812.56 ms` for text fillfactor `50`).  Locality stayed in the
 same shape, so ordering the input by itself is not a reliable substitute for
 reducing target-probe cost.
+For hot insert+update COPY pressure, though, ordered input is now a promising
+profile rather than a dead end.  In a scale `1`, repeat `3`, fillfactor `50`,
+`hot_tile_count=128`, `hot_update_fraction=0.9` run, ordering by clustered key
+changed the workload shape from "reserve consumed in many small per-batch
+prefixes" to "dense prefixes overflow compactly".  Payload `8` recovered
+clustered `update_hot` from `0%` to `86.88%` inside base, cut clustered insert
+median from `350.89 ms` to `107.58 ms`, and improved broad hot reads
+(`read_hot` median `22.02 ms` to `14.77 ms`).  Payload `64` recovered
+`update_hot` from `0%` to `15.50%` and cut clustered insert median from
+`249.40 ms` to `129.00 ms`.  The tradeoff is explicit: `insert_hot` mostly
+moves to a compact tail (`0.21%` inside base), so this is an osm2pgsql diff
+ordering strategy to benchmark against real append/read workloads, not a claim
+that new duplicate-key rows stay in the original clustered range.  Raw gzip
+output is under
+`/home/kom/tmp/clustered-write-synthetic/hot-update-order-copy-ab-20260501-133942/`.
 
 Set `COPY_DIFF_FROM_FILE_VALUES="false true"` to compare the default
 `INSERT ... SELECT` diff path with a server-side `COPY ... FROM` path.  The
