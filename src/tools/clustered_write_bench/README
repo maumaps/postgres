@@ -176,6 +176,18 @@ ordering strategy to benchmark against real append/read workloads, not a claim
 that new duplicate-key rows stay in the original clustered range.  Raw gzip
 output is under
 `/home/kom/tmp/clustered-write-synthetic/hot-update-order-copy-ab-20260501-133942/`.
+A follow-up generated text-key run, matching the osm2pgsql geohash-key shape
+more closely, kept the same locality result.  At scale `1`, repeat `2`,
+fillfactor `50`, `text_cluster_key=true`, payload `8`, ordered COPY recovered
+clustered `update_hot` from `0%` to `86.88%`, cut clustered insert median from
+`370.74 ms` to `134.47 ms`, and improved `read_updated_hot` median from
+`48.67 ms` to `27.56 ms`; payload `64` recovered `update_hot` from `0%` to
+`15.50%` and cut insert median from `347.72 ms` to `135.43 ms`.  Broad
+`read_hot` was noisier for text payload `64`, so the next real-osm2pgsql run
+should measure both append write time and read slices, but the update-locality
+and write-cost direction transfers from integer keys to generated text keys.
+Raw gzip output is under
+`/home/kom/tmp/clustered-write-synthetic/hot-update-order-text-copy-ab-20260501-134352/`.
 
 Set `COPY_DIFF_FROM_FILE_VALUES="false true"` to compare the default
 `INSERT ... SELECT` diff path with a server-side `COPY ... FROM` path.  The
