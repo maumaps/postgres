@@ -392,11 +392,14 @@ Useful overrides:
 * `BENCH_VARIANTS=baseline_stock,patched_stock` runs only selected variants.
 * `READ_REPEATS=3` runs the read benchmark several times against the same
   imported database.  This is much cheaper than repeating the full import and
-  makes cache/scheduler outliers visible in the read numbers.
+  makes cache/scheduler outliers visible in the read numbers.  Set
+  `READ_REPEATS=0` for append-only diagnostic runs.
 * `COMPRESS_LOGS=false` leaves per-variant logs uncompressed.
 * `KEEP_PGDATA=true` keeps finished or failed PostgreSQL data directories for
   manual inspection.  The default is to delete them; use a fresh `$WORKDIR` for
   repeat runs if you keep data around.
+* `PG_LOG_MIN_DURATION_MS=500` enables PostgreSQL statement-duration logging
+  for slow-statement diagnosis in the per-variant `*-postgres.log`.
 
 Only selected variants need their PostgreSQL and osm2pgsql binaries to exist.
 Common input-preparation tools such as curl, osmium, awk, sed, and the
@@ -696,6 +699,19 @@ Do not repeat these paths blindly:
   staging table.  Georgia `978` regressed to `3:24.06` append.  The kept
   variant adds a temporary delete-key index for append staging tables and brings
   append back to `2:13.45` while keeping the tight heap shape.
+* **Direct append into clustered real tables:** rejected.  The idea was to use
+  ordered staging only for initial import, then let append COPY directly into
+  the already-clustered real heap and rely on PostgreSQL clustered-write
+  placement.  This removed the expensive staged `INSERT ... SELECT ... ORDER
+  BY` drain and improved Georgia `978` append to `2:05.19`, with `Reading input
+  files` down to `121s`, but it destroyed the storage/read shape: database size
+  grew to `3370 MB`, p95 spans became `8249` line, `7526` point, and `6653.5`
+  polygon, and read timings regressed to `224.320 ms` point bbox,
+  `1005.170 ms` line bbox, `1612.676 ms` polygon bbox, `1224.795 ms` roads
+  exact, and `3732.839 ms` polygon exact.  The kept append path still needs the
+  ordered drain, even though it is now the obvious remaining cost center.  Raw
+  gzip logs are under
+  `/home/kom/tmp/clustered-write-osm2pgsql-direct-append-read-20260501-164635/`.
 * **Plain real-table geohash key with generated staging key:** rejected.  This
   tried to avoid computing `ST_GeoHash(ST_Transform(ST_Envelope(way), 4326), 7)`
   twice by making the real table's `osm2pgsql_cluster_key` a plain text column,

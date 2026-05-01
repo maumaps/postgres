@@ -26,6 +26,7 @@ BENCH_VARIANTS="${BENCH_VARIANTS:-baseline_stock,patched_stock,patched_clustered
 READ_REPEATS="${READ_REPEATS:-1}"
 COMPRESS_LOGS="${COMPRESS_LOGS:-true}"
 KEEP_PGDATA="${KEEP_PGDATA:-false}"
+PG_LOG_MIN_DURATION_MS="${PG_LOG_MIN_DURATION_MS:-}"
 
 mkdir -p "$WORKDIR"/{data,logs,pgdata}
 
@@ -194,6 +195,11 @@ synchronous_commit = off
 full_page_writes = off
 autovacuum = off
 EOF
+    if [[ -n "$PG_LOG_MIN_DURATION_MS" ]]; then
+        cat >>"$data_dir/postgresql.conf" <<EOF
+log_min_duration_statement = ${PG_LOG_MIN_DURATION_MS}
+EOF
+    fi
     "$pg_bin/pg_ctl" -D "$data_dir" -l "$log_file" -o "-p $port -k $socket_dir" start
 }
 
@@ -254,6 +260,11 @@ run_read_benchmarks()
     local port="$3"
     local read_run
     local out_prefix
+
+    if (( READ_REPEATS <= 0 )); then
+        log "skipping read benchmark for $name (READ_REPEATS=$READ_REPEATS)"
+        return
+    fi
 
     for read_run in $(seq 1 "$READ_REPEATS"); do
         if [[ "$READ_REPEATS" == "1" ]]; then
@@ -365,6 +376,7 @@ write_run_environment()
         printf 'read_repeats: %s\n' "$READ_REPEATS"
         printf 'compress_logs: %s\n' "$COMPRESS_LOGS"
         printf 'keep_pgdata: %s\n' "$KEEP_PGDATA"
+        printf 'pg_log_min_duration_ms: %s\n' "${PG_LOG_MIN_DURATION_MS:-off}"
         printf 'uname: '
         uname -a
         printf 'uptime: '
@@ -412,6 +424,7 @@ log "  workdir=$WORKDIR"
 log "  read_repeats=$READ_REPEATS"
 log "  compress_logs=$COMPRESS_LOGS"
 log "  keep_pgdata=$KEEP_PGDATA"
+log "  pg_log_min_duration_ms=${PG_LOG_MIN_DURATION_MS:-off}"
 
 write_run_environment
 
