@@ -23,6 +23,8 @@ PG_PORT_BASE="${PG_PORT_BASE:-55432}"
 OSM2PGSQL_CACHE_MB="${OSM2PGSQL_CACHE_MB:-2048}"
 OSM2PGSQL_PROCS="${OSM2PGSQL_PROCS:-4}"
 BENCH_VARIANTS="${BENCH_VARIANTS:-baseline_stock,patched_stock,patched_clustered_import}"
+COMPRESS_LOGS="${COMPRESS_LOGS:-true}"
+KEEP_PGDATA="${KEEP_PGDATA:-false}"
 
 mkdir -p "$WORKDIR"/{data,logs,pgdata}
 
@@ -207,6 +209,33 @@ stop_server()
     fi
 }
 
+compress_variant_logs()
+{
+    local name="$1"
+
+    if [[ "$COMPRESS_LOGS" != "true" ]]; then
+        return
+    fi
+
+    find "$WORKDIR/logs" -maxdepth 1 -type f -name "$name-*" \
+        ! -name '*.gz' -exec gzip -f {} +
+}
+
+cleanup_variant()
+{
+    local pg_bin="$1"
+    local name="$2"
+    local port="$3"
+    local data_dir="$WORKDIR/pgdata/$name"
+
+    stop_server "$pg_bin" "$name" "$port"
+    compress_variant_logs "$name"
+
+    if [[ "$KEEP_PGDATA" != "true" ]]; then
+        rm -rf "$data_dir"
+    fi
+}
+
 run_psql()
 {
     local pg_bin="$1"
@@ -235,7 +264,7 @@ run_variant()
 
     log "starting PostgreSQL for $name on port $port"
     start_server "$name" "$pg_bin" "$port"
-    trap "stop_server '$pg_bin' '$name' '$port'" EXIT
+    trap "cleanup_variant '$pg_bin' '$name' '$port'" EXIT
 
     "$pg_bin/createdb" -h 127.0.0.1 -p "$port" osm
     run_psql "$pg_bin" "$port" osm -c 'create extension postgis; create extension hstore;'
@@ -282,8 +311,45 @@ run_variant()
         -c "select current_database() as db, pg_size_pretty(pg_database_size(current_database())) as database_size;" \
         >"$WORKDIR/logs/$name-size.sqlout"
 
-    stop_server "$pg_bin" "$name" "$port"
+    cleanup_variant "$pg_bin" "$name" "$port"
     trap - EXIT
+}
+
+write_run_environment()
+{
+    {
+        printf 'date: '
+        date -Is
+        printf 'root_dir: %s\n' "$ROOT_DIR"
+        printf 'bench_dir: %s\n' "$BENCH_DIR"
+        if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            printf 'git_head: %s\n' "$(git -C "$ROOT_DIR" rev-parse HEAD)"
+            printf 'git_branch: %s\n' "$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)"
+        fi
+        printf 'workdir: %s\n' "$WORKDIR"
+        printf 'georgia_url: %s\n' "$GEORGIA_URL"
+        printf 'planet_day_state_url: %s\n' "$PLANET_DAY_STATE_URL"
+        printf 'osc_url: %s\n' "$OSC_URL"
+        printf 'patched_pg_bin: %s\n' "$PATCHED_PG_BIN"
+        printf 'baseline_pg_bin: %s\n' "$BASELINE_PG_BIN"
+        printf 'stock_osm2pgsql: %s\n' "$STOCK_OSM2PGSQL"
+        printf 'clustered_osm2pgsql: %s\n' "$CLUSTERED_OSM2PGSQL"
+        printf 'osm2pgsql_style: %s\n' "$OSM2PGSQL_STYLE"
+        printf 'osmium: %s\n' "$OSMIUM"
+        printf 'postgis_share: %s\n' "$POSTGIS_SHARE"
+        printf 'postgis_lib: %s\n' "$POSTGIS_LIB"
+        printf 'pg_port_base: %s\n' "$PG_PORT_BASE"
+        printf 'osm2pgsql_cache_mb: %s\n' "$OSM2PGSQL_CACHE_MB"
+        printf 'osm2pgsql_procs: %s\n' "$OSM2PGSQL_PROCS"
+        printf 'bench_variants: %s\n' "$BENCH_VARIANTS"
+        printf 'compress_logs: %s\n' "$COMPRESS_LOGS"
+        printf 'keep_pgdata: %s\n' "$KEEP_PGDATA"
+        printf 'uname: '
+        uname -a
+        printf 'uptime: '
+        uptime
+        df -h "$WORKDIR" "${TMPDIR:-/tmp}" 2>/dev/null || true
+    } >"$WORKDIR/run_environment.txt"
 }
 
 require_executable curl
@@ -322,6 +388,10 @@ log "  daily_diff=$daily_diff_url"
 log "  simplified_daily_diff=$simplified_daily_diff"
 log "  variants=$BENCH_VARIANTS"
 log "  workdir=$WORKDIR"
+log "  compress_logs=$COMPRESS_LOGS"
+log "  keep_pgdata=$KEEP_PGDATA"
+
+write_run_environment
 
 if variant_enabled baseline_stock; then
     run_variant baseline_stock "$BASELINE_PG_BIN" "$((PG_PORT_BASE + 1))" "$stock_osm2pgsql_path" stock "$georgia_pbf" "$simplified_daily_diff"

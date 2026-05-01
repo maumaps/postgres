@@ -375,6 +375,11 @@ daily diff append.  The read side runs spatial bbox and exact-intersection
 queries from `osm2pgsql_georgia_read.sql`, with `EXPLAIN (ANALYZE, BUFFERS)`,
 and also reports a geohash-to-heap-block locality summary.  All output goes
 under `$WORKDIR/logs` (`$HOME/tmp/clustered-write-osm2pgsql/logs` by default).
+The real-workload harness now mirrors the synthetic wrapper's disk hygiene:
+`run_environment.txt` records the selected git head, binaries, benchmark
+settings, host load, and filesystem space; per-variant logs are gzip-compressed
+by default; and each variant's `pgdata` is removed after the server stops so a
+failed long run does not quietly fill the disk.
 
 Useful overrides:
 
@@ -385,6 +390,10 @@ Useful overrides:
 * `OSM2PGSQL_STYLE=/path/to/default.style` selects the pgsql style file.
 * `OSC_URL=https://...osc.gz` pins a specific planet daily diff.
 * `BENCH_VARIANTS=baseline_stock,patched_stock` runs only selected variants.
+* `COMPRESS_LOGS=false` leaves per-variant logs uncompressed.
+* `KEEP_PGDATA=true` keeps finished or failed PostgreSQL data directories for
+  manual inspection.  The default is to delete them; use a fresh `$WORKDIR` for
+  repeat runs if you keep data around.
 
 Only selected variants need their PostgreSQL and osm2pgsql binaries to exist.
 Common input-preparation tools such as curl, osmium, awk, sed, and the
@@ -518,6 +527,20 @@ Raw gzip logs are under
 `/home/kom/tmp/clustered-write-osm2pgsql-current-ab-20260501-151937/`,
 `/home/kom/tmp/clustered-write-osm2pgsql-staged-delete-20260501-153348/`, and
 `/home/kom/tmp/clustered-write-osm2pgsql-staged-delete-index-20260501-154406/`.
+
+A repeat of only `patched_clustered_import` with the same Georgia `978` inputs
+confirmed the point bbox spike was not stable: point bbox read was
+`978.990 ms`, not `3163.663 ms`.  The heap shape stayed tight (`2/2` line,
+`2/1` point, `3/2` polygon p95 block/span), database size stayed `2840 MB`,
+and reads were `1146.925 ms` line bbox, `1912.456 ms` polygon bbox,
+`293.356 ms` roads exact, and `2053.134 ms` polygon exact.  Write timings were
+noisier (`1:07.54` create, `2:51.11` append), so the honest conclusion is that
+the staged-delete-index shape is a real locality win and a plausible append
+shape, but final read/write claims need repeat medians rather than a single
+host-load-sensitive run.  This repeat also verified the real-workload harness
+cleanup path: per-variant logs were gzip-compressed and `pgdata` was removed
+with `KEEP_PGDATA=false`.  Raw gzip logs and `run_environment.txt` are under
+`/home/kom/tmp/clustered-write-osm2pgsql-staged-delete-index-rerun-20260501-155455/`.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
