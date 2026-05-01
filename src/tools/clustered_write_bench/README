@@ -604,6 +604,20 @@ Do not repeat these paths blindly:
   `6:08` append, worse reads, and long p95 spans (`15301`, `1776`,
   `20334.5` for line/point/polygon).  The current experiment keeps separate
   temporary staging tables per target and drains them on sync.
+* **Plain real-table geohash key with generated staging key:** rejected.  This
+  tried to avoid computing `ST_GeoHash(ST_Transform(ST_Envelope(way), 4326), 7)`
+  twice by making the real table's `osm2pgsql_cluster_key` a plain text column,
+  while the temporary staging table computed the generated key and copied it
+  into the real heap during the ordered drain.  Correctness was fine after
+  append (`0` NULL keys and `0` mismatches on point/line/polygon/roads; the
+  real columns were plain, not generated), but the Georgia `978` run regressed
+  badly to `3:42.88` create and `4:18.57` append with unchanged locality
+  (`3/2367.75`, `3/1024`, `3/1643` p95 block/span).  Read timings were mixed:
+  roads exact improved to `462.948 ms`, but polygon exact regressed to
+  `3509.093 ms`, and bbox reads were slower than the deferred-index generated
+  key run.  The extra real-column/staging plumbing is therefore not the missing
+  cost center.  Raw gzip logs are under
+  `/home/kom/tmp/clustered-write-osm2pgsql-plain-key-stage-20260501-145922/`.
 * **CTAS final rewrite for the generated-key osm2pgsql experiment:** rejected
   as a correctness shape even though it had the best single-run append timing
   (`1:54.96`).  `CREATE TABLE AS SELECT *` does not preserve the generated
