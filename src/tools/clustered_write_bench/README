@@ -833,6 +833,25 @@ Do not repeat these paths blindly:
   `/home/kom/tmp/clustered-write-synthetic/update-payload-hot-matrix-20260501-132655/`
   and
   `/home/kom/tmp/clustered-write-synthetic/update-payload-before-after-20260501-132803/`.
+* **Disabling below-fillfactor clustered reserve for all bulk/COPY clustered
+  targets:** rejected.  The prototype changed `RelationGetBufferForTuple()` so
+  bulk insert callers could only use clustered neighbour pages that satisfied
+  the normal fillfactor-aware target free-space threshold, leaving reserve
+  space for future moved updates.  It proved the reserve-conflict diagnosis:
+  in a scale `1`, repeat `2`, fillfactor `50`, `hot_tile_count=128`,
+  `hot_update_fraction=0.9`, COPY run, payload `8` recovered clustered
+  `update_hot` from `0%` to `87.50%`, and payload `64` recovered it to the
+  control-like `15.63%`.  But the price was too broad: clustered `insert_hot`
+  fell to `0%` inside base, and a non-hot/hot COPY insert sweep also drove
+  ordinary clustered insert locality to `0%` for fillfactor `90` and `50`,
+  with worse spans than the control in several cases.  The code was reverted;
+  the useful lesson is narrower than "bulk inserts must never consume reserve".
+  A viable fix needs to identify update-pressure or massive duplicate-key
+  insert phases more specifically, not remove clustered reserve use from every
+  COPY path.  Raw gzip outputs are under
+  `/home/kom/tmp/clustered-write-synthetic/no-bulk-reserve-proto-20260501-133332/`
+  and
+  `/home/kom/tmp/clustered-write-synthetic/no-bulk-reserve-nonhot-proto-20260501-133415/`.
 * **Relying on ordered diff input as the non-hot cost fix:** rejected as a
   standalone answer.  A scale `1`, repeat `3`, single-key `hot=0` run with
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` kept the same locality shape
