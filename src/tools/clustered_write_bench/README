@@ -390,6 +390,8 @@ Useful overrides:
 * `OSM2PGSQL_STYLE=/path/to/default.style` selects the pgsql style file.
 * `OSC_URL=https://...osc.gz` pins a specific planet daily diff.
 * `BENCH_VARIANTS=baseline_stock,patched_stock` runs only selected variants.
+* `PG_WORK_MEM=256MB` changes the benchmark cluster `work_mem`.  The default is
+  `64MB`, matching the earlier runs.
 * `READ_REPEATS=3` runs the read benchmark several times against the same
   imported database.  This is much cheaper than repeating the full import and
   makes cache/scheduler outliers visible in the read numbers.  Set
@@ -581,6 +583,22 @@ fix.  The harness removed the per-variant data directory with
 `KEEP_PGDATA=false`; only the empty `$WORKDIR/pgdata` parent remains.  Raw gzip
 logs are under
 `/home/kom/tmp/clustered-write-osm2pgsql-lazy-delete-index-20260501-162417/`.
+
+An append-only slow-statement run showed the remaining clustered append cost is
+mostly the ordered staging path, especially the final `INSERT ... SELECT ...
+ORDER BY` drain into the real heap.  Raising the benchmark `work_mem` from
+`64MB` to `256MB` is a useful near-term knob for that drain.  With the same
+kept staged/lazy-index shape, an append-only Georgia `978` run measured
+`1:23.89` create, `2:10.95` append, `2840 MB` size, and reduced slow logged
+staged-drain time above `1s` from `59.6s` to `43.3s`.  A follow-up single-read
+run measured `1:18.84` create, `2:13.68` append, `2840 MB`, read timings
+`205.257 ms` point bbox, `611.452 ms` line bbox, `1418.884 ms` polygon bbox,
+`210.900 ms` roads exact, and `1116.870 ms` polygon exact, while preserving
+p95 block/span `2/2` line, `2/1` point, and `3/2` polygon.  This is not a new
+algorithmic fix, but it is a practical benchmark and deployment knob for the
+current ordered-drain cost center.  Raw gzip logs are under
+`/home/kom/tmp/clustered-write-osm2pgsql-workmem256-20260501-165334/` and
+`/home/kom/tmp/clustered-write-osm2pgsql-workmem256-read-20260501-165743/`.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql

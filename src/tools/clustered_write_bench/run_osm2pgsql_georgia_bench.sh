@@ -22,6 +22,7 @@ POSTGIS_LIB="${POSTGIS_LIB:-/usr/lib/postgresql/18/lib}"
 PG_PORT_BASE="${PG_PORT_BASE:-55432}"
 OSM2PGSQL_CACHE_MB="${OSM2PGSQL_CACHE_MB:-2048}"
 OSM2PGSQL_PROCS="${OSM2PGSQL_PROCS:-4}"
+PG_WORK_MEM="${PG_WORK_MEM:-64MB}"
 BENCH_VARIANTS="${BENCH_VARIANTS:-baseline_stock,patched_stock,patched_clustered_import}"
 READ_REPEATS="${READ_REPEATS:-1}"
 COMPRESS_LOGS="${COMPRESS_LOGS:-true}"
@@ -187,7 +188,7 @@ start_server()
     cat >>"$data_dir/postgresql.conf" <<EOF
 shared_buffers = '1GB'
 maintenance_work_mem = '1GB'
-work_mem = '64MB'
+work_mem = '$PG_WORK_MEM'
 checkpoint_timeout = '30min'
 max_wal_size = '16GB'
 fsync = off
@@ -370,6 +371,7 @@ write_run_environment()
         printf 'postgis_share: %s\n' "$POSTGIS_SHARE"
         printf 'postgis_lib: %s\n' "$POSTGIS_LIB"
         printf 'pg_port_base: %s\n' "$PG_PORT_BASE"
+        printf 'pg_work_mem: %s\n' "$PG_WORK_MEM"
         printf 'osm2pgsql_cache_mb: %s\n' "$OSM2PGSQL_CACHE_MB"
         printf 'osm2pgsql_procs: %s\n' "$OSM2PGSQL_PROCS"
         printf 'bench_variants: %s\n' "$BENCH_VARIANTS"
@@ -421,6 +423,7 @@ log "  daily_diff=$daily_diff_url"
 log "  simplified_daily_diff=$simplified_daily_diff"
 log "  variants=$BENCH_VARIANTS"
 log "  workdir=$WORKDIR"
+log "  pg_work_mem=$PG_WORK_MEM"
 log "  read_repeats=$READ_REPEATS"
 log "  compress_logs=$COMPRESS_LOGS"
 log "  keep_pgdata=$KEEP_PGDATA"
