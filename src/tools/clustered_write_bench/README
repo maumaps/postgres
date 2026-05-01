@@ -446,28 +446,44 @@ the long p95 heap span while the initial COPY stream stayed unordered, and
 
 Rewriting the final heap by `osm2pgsql_cluster_key, osm_id` fixed the heap-span
 diagnosis, but the first `CREATE TABLE AS SELECT *` prototype silently turned
-the generated key into a plain text column.  The checked-in experiment now
-rebuilds the final heap with `CREATE TABLE ... LIKE ... INCLUDING GENERATED`
-and ordered `INSERT`, so later diff rows keep computing the key.  A catalog
-check after append confirmed all four OSM tables still have stored generated
-`osm2pgsql_cluster_key` columns and zero NULL keys.  This is a correctness win
-with a mixed timing profile: initial import is faster than the CTAS prototype
-and append remains faster than the stock baseline, but exact polygon reads were
-noisier/slower in this single run.  The cost is still a real table rewrite, so
-this is best read as the correctness/performance target for a future global or
-external sort before COPY rather than as proof that the pre-COPY btree alone is
-enough.  Small bounded in-memory COPY sort windows were tested after this point
-and rejected: they lowered or raised initial import time depending on the
-window, but left `osm2pgsql_cluster_key` correlation poor and made diff append
-much slower.
+the generated key into a plain text column.  Rebuilding the final heap with
+`CREATE TABLE ... LIKE ... INCLUDING GENERATED` and ordered `INSERT` preserved
+the generated key after append, but it was still a full post-import rewrite.
+
+The current osm2pgsql experiment moves that ordered step into the COPY path.
+Rows are copied into per-target temporary tables created `LIKE` the real target
+`INCLUDING GENERATED`; on sync, each target drains into the real heap with
+`ORDER BY osm2pgsql_cluster_key, osm_id`.  A first attempt that used a single
+temporary staging table was rejected because target-table switches drained
+many small ordered fragments, leaving poor key correlation and long spans
+(`6:06` create, `6:08` append, p95 spans `15301/1776/20334.5` for
+line/point/polygon).
+
+The per-target staging run on Georgia + planet daily diff `978` is more
+useful, but still not a win over the previous rewrite target.  With patched
+PostgreSQL `19devel`, PostGIS `3.7`, osm2pgsql `2.2.0`,
+`OSM2PGSQL_CACHE_MB=1024`, and `OSM2PGSQL_PROCS=2`, it measured `3:15.36`
+create, `3:10.19` append, and `2793 MB` database size.  Read timings were
+`329.192 ms` point bbox, `1140.398 ms` line bbox, `1849.375 ms` polygon bbox,
+`182.531 ms` roads exact, and `3151.490 ms` polygon exact.  Locality improved
+over fragment staging to p95 block/span `3/2647.75` line, `3/1069` point, and
+`3/1657` polygon, but generated-key correlations remained mixed
+(`line=0.4769`, `point=-0.0581`, `polygon=-0.5369`, `roads=0.4759`).  This is
+a working external-sort-shaped prototype, not yet the desired production
+shape: write time is still too high, and bbox reads regressed versus the
+generated-preserving rewrite run.  Small bounded in-memory COPY sort windows
+were tested before this point and rejected: they lowered or raised initial
+import time depending on the window, but left `osm2pgsql_cluster_key`
+correlation poor and made diff append much slower.
 
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
 checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
 adds `--cluster-during-import`, creates a generated geometry-derived geohash key
 and a clustered btree index before the first COPY, creates the heap with
-`fillfactor=90`, rewrites the loaded heap by that key while preserving the
-generated column, and restores the clustered btree marker before diff append.
+`fillfactor=90`, stages COPY rows in per-target temporary tables, and drains
+those staged rows ordered by the generated key before final index creation or
+diff append.
 
 Directly clustering the import tables with a pre-COPY GiST index on `way` was
 also tested as a negative control.  It worked functionally, but maintaining the
@@ -561,12 +577,19 @@ Do not repeat these paths blindly:
   repair correlation (`line≈0`, `point=-0.1958`, `polygon=-0.6488`,
   `roads=0.4155`).  The copy stream needs a global/external sort, not this
   small micro-sort.
+* **Single temporary table for ordered staged COPY:** rejected.  It was
+  functionally correct, but every target-table switch closed and drained the
+  staging table, so the real heap was a sequence of small ordered fragments
+  instead of one ordered run per target.  Georgia `978` measured `6:06` create,
+  `6:08` append, worse reads, and long p95 spans (`15301`, `1776`,
+  `20334.5` for line/point/polygon).  The current experiment keeps separate
+  temporary staging tables per target and drains them on sync.
 * **CTAS final rewrite for the generated-key osm2pgsql experiment:** rejected
   as a correctness shape even though it had the best single-run append timing
   (`1:54.96`).  `CREATE TABLE AS SELECT *` does not preserve the generated
   column, so later append rows would stop computing `osm2pgsql_cluster_key`.
-  The checked-in experiment uses `LIKE ... INCLUDING GENERATED` plus ordered
-  `INSERT` instead.
+  Later experiments use `LIKE ... INCLUDING GENERATED` plus ordered `INSERT`
+  semantics instead.
 * **`datum_image_hash()` prefix cache for varlena leading keys:** rejected.
   This tried to make the clustered btree prefix cache direct-mapped for the
   generated text geohash key instead of doing linear opfamily equality checks.

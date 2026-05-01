@@ -152,10 +152,16 @@ copy_postgis_into_install()
     pg_lib_dir="$(cd "$pg_home/lib" && pwd -P)"
 
     if [[ "$(cd "$POSTGIS_SHARE" && pwd -P)" != "$pg_extension_dir" ]]; then
+        rm -f "$pg_home/share/extension"/postgis*
+        rm -f "$pg_home/share/extension"/address_standardizer*
         cp -a "$POSTGIS_SHARE"/postgis* "$pg_home/share/extension/"
+        cp -a "$POSTGIS_SHARE"/sql/postgis* "$pg_home/share/extension/" 2>/dev/null || true
         cp -a "$POSTGIS_SHARE"/address_standardizer* "$pg_home/share/extension/" 2>/dev/null || true
+        cp -a "$POSTGIS_SHARE"/sql/address_standardizer* "$pg_home/share/extension/" 2>/dev/null || true
     fi
     if [[ "$(cd "$POSTGIS_LIB" && pwd -P)" != "$pg_lib_dir" ]]; then
+        rm -f "$pg_home/lib"/postgis-*.so
+        rm -f "$pg_home/lib"/postgis_raster-*.so
         cp -a "$POSTGIS_LIB"/postgis-*.so "$pg_home/lib/"
         cp -a "$POSTGIS_LIB"/postgis_raster-*.so "$pg_home/lib/" 2>/dev/null || true
     fi
@@ -168,8 +174,11 @@ start_server()
     local port="$3"
     local data_dir="$WORKDIR/pgdata/$name"
     local log_file="$WORKDIR/logs/$name-postgres.log"
+    local socket_dir="${TMPDIR:-/tmp}/clustered-write-osm2pgsql-$port"
 
     rm -rf "$data_dir"
+    rm -rf "$socket_dir"
+    mkdir -p "$socket_dir"
     "$pg_bin/initdb" -D "$data_dir" >"$WORKDIR/logs/$name-initdb.log"
     cat >>"$data_dir/postgresql.conf" <<EOF
 shared_buffers = '1GB'
@@ -182,16 +191,20 @@ synchronous_commit = off
 full_page_writes = off
 autovacuum = off
 EOF
-    "$pg_bin/pg_ctl" -D "$data_dir" -l "$log_file" -o "-p $port -k $data_dir" start
+    "$pg_bin/pg_ctl" -D "$data_dir" -l "$log_file" -o "-p $port -k $socket_dir" start
 }
 
 stop_server()
 {
     local pg_bin="$1"
     local name="$2"
+    local port="${3:-}"
     local data_dir="$WORKDIR/pgdata/$name"
 
     "$pg_bin/pg_ctl" -D "$data_dir" -m fast stop >/dev/null 2>&1 || true
+    if [[ -n "$port" ]]; then
+        rm -rf "${TMPDIR:-/tmp}/clustered-write-osm2pgsql-$port"
+    fi
 }
 
 run_psql()
@@ -222,7 +235,7 @@ run_variant()
 
     log "starting PostgreSQL for $name on port $port"
     start_server "$name" "$pg_bin" "$port"
-    trap "stop_server '$pg_bin' '$name'" EXIT
+    trap "stop_server '$pg_bin' '$name' '$port'" EXIT
 
     "$pg_bin/createdb" -h 127.0.0.1 -p "$port" osm
     run_psql "$pg_bin" "$port" osm -c 'create extension postgis; create extension hstore;'
@@ -248,9 +261,14 @@ run_variant()
         >"$WORKDIR/logs/$name-create.stdout" \
         2>"$WORKDIR/logs/$name-create.stderr"
 
+    local append_args=(--append)
+    if [[ "$mode" == "clustered_import" ]]; then
+        append_args+=(--cluster-during-import)
+    fi
+
     log "daily diff append for $name"
     /usr/bin/time -v -o "$WORKDIR/logs/$name-append.time" \
-        "$osm2pgsql" "${common_args[@]}" --append "$osc" \
+        "$osm2pgsql" "${common_args[@]}" "${append_args[@]}" "$osc" \
         >"$WORKDIR/logs/$name-append.stdout" \
         2>"$WORKDIR/logs/$name-append.stderr"
 
@@ -264,7 +282,7 @@ run_variant()
         -c "select current_database() as db, pg_size_pretty(pg_database_size(current_database())) as database_size;" \
         >"$WORKDIR/logs/$name-size.sqlout"
 
-    stop_server "$pg_bin" "$name"
+    stop_server "$pg_bin" "$name" "$port"
     trap - EXIT
 }
 
