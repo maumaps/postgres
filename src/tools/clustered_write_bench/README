@@ -496,14 +496,38 @@ the append/drain cost rather than correctness or heap compactness.  Raw gzip
 logs are under
 `/home/kom/tmp/clustered-write-osm2pgsql-ordered-deferred-index-20260501-143958/`.
 
+The current staging shape keeps DELETEs from fragmenting that ordered run.  When
+append-mode osm2pgsql receives deletes for a target table, the copy thread now
+removes matching ids from the target's temporary staging table instead of
+draining the whole staging table before the DELETE.  Append-mode staging tables
+also get a temporary btree index on the delete key (`osm_id`, or the existing
+type/id key) so those temp-table deletes do not become full scans as the staged
+batch grows.  In a same-environment A/B against stock osm2pgsql on patched
+PostgreSQL, stock measured `1:58.33` create and `2:05.22` append, while the
+clustered import measured `1:30.30` create and `2:13.45` append.  The clustered
+run had a larger heap (`2840 MB` versus `2727 MB`) but much tighter locality:
+p95 block/span was `2/2` line, `2/1` point, and `3/2` polygon, compared with
+stock `7/2381`, `6/1002`, and `32/1208`.  Most read timings improved or stayed
+close (`627.029 ms` line bbox, `954.597 ms` polygon bbox, `184.525 ms` roads
+exact, `1251.008 ms` polygon exact), while one point bbox timing spiked to
+`3163.663 ms` in that run and should be treated as read noise until repeated.
+The rejected intermediate variant without the temporary delete-key index proved
+why the index is needed: it preserved the same tight locality but append
+regressed to `3:24.06` because deletes scanned the growing temp staging tables.
+Raw gzip logs are under
+`/home/kom/tmp/clustered-write-osm2pgsql-current-ab-20260501-151937/`,
+`/home/kom/tmp/clustered-write-osm2pgsql-staged-delete-20260501-153348/`, and
+`/home/kom/tmp/clustered-write-osm2pgsql-staged-delete-index-20260501-154406/`.
+
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
 checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
 adds `--cluster-during-import`, creates a generated geometry-derived geohash key
 and a heap with `fillfactor=90`, stages COPY rows in per-target temporary
-tables, drains those staged rows ordered by the generated key, then creates and
-marks the clustered btree index before final GiST/osm_id index creation.  Append
-runs keep using the existing generated-key clustered index.
+tables, removes matching staged rows on append DELETEs, drains those staged rows
+ordered by the generated key, then creates and marks the clustered btree index
+before final GiST/osm_id index creation.  Append runs keep using the existing
+generated-key clustered index.
 
 Directly clustering the import tables with a pre-COPY GiST index on `way` was
 also tested as a negative control.  It worked functionally, but maintaining the
@@ -604,6 +628,13 @@ Do not repeat these paths blindly:
   `6:08` append, worse reads, and long p95 spans (`15301`, `1776`,
   `20334.5` for line/point/polygon).  The current experiment keeps separate
   temporary staging tables per target and drains them on sync.
+* **Deleting from staged COPY tables without a temp delete-key index:** rejected
+  as a standalone fix.  It avoided the correctness-preserving drain before each
+  DELETE and achieved the desired heap shape (`2/2`, `2/1`, `3/2` p95
+  block/span for line/point/polygon), but each DELETE scanned the growing
+  staging table.  Georgia `978` regressed to `3:24.06` append.  The kept
+  variant adds a temporary delete-key index for append staging tables and brings
+  append back to `2:13.45` while keeping the tight heap shape.
 * **Plain real-table geohash key with generated staging key:** rejected.  This
   tried to avoid computing `ST_GeoHash(ST_Transform(ST_Envelope(way), 4326), 7)`
   twice by making the real table's `osm2pgsql_cluster_key` a plain text column,

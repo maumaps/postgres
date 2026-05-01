@@ -16,7 +16,7 @@ index 232a70a..4a98592 100644
      app.add_flag("-K,--keep-coastlines", options.keep_coastlines)
          ->description("Keep coastline data (default: discard objects tagged"
 diff --git a/src/db-copy.cpp b/src/db-copy.cpp
-index 1a7dede..eda2881 100644
+index 1a7dede..a5886e3 100644
 --- a/src/db-copy.cpp
 +++ b/src/db-copy.cpp
 @@ -165,6 +165,7 @@ void db_copy_thread_t::thread_t::operator()()
@@ -32,7 +32,7 @@ index 1a7dede..eda2881 100644
          (m_inflight && !cmd.target->same_copy_target(*m_inflight))) {
          finish_copy();
 +        if (cmd.has_deletables() && cmd.target->uses_ordered_copy()) {
-+            drain_ordered_copy_table(cmd.target);
++            delete_from_ordered_copy_table(cmd);
 +        }
      }
 
@@ -70,7 +70,7 @@ index 1a7dede..eda2881 100644
                         target->rows());
      }
 
-@@ -233,3 +245,51 @@ void db_copy_thread_t::thread_t::finish_copy()
+@@ -233,3 +245,78 @@ void db_copy_thread_t::thread_t::finish_copy()
          m_inflight.reset();
      }
  }
@@ -78,10 +78,8 @@ index 1a7dede..eda2881 100644
 +void db_copy_thread_t::thread_t::ensure_ordered_copy_table(
 +    std::shared_ptr<db_target_descr_t> const &target)
 +{
-+    for (auto const &known : m_ordered_copy_targets) {
-+        if (target->same_copy_target(*known)) {
-+            return;
-+        }
++    if (has_ordered_copy_table(target)) {
++        return;
 +    }
 +
 +    auto const qname = qualified_name(target->schema(), target->name());
@@ -89,20 +87,49 @@ index 1a7dede..eda2881 100644
 +        R"(CREATE TEMP TABLE "{}" (LIKE {} INCLUDING GENERATED) )"
 +        "ON COMMIT PRESERVE ROWS",
 +        target->ordered_copy_table(), qname);
++    if (target->has_ordered_copy_delete_index()) {
++        m_db_connection.exec(R"(CREATE INDEX ON "{}" ({}))",
++                             target->ordered_copy_table(),
++                             target->ordered_copy_delete_index_by());
++    }
 +    m_ordered_copy_targets.push_back(target);
++}
++
++bool db_copy_thread_t::thread_t::has_ordered_copy_table(
++    std::shared_ptr<db_target_descr_t> const &target) const
++{
++    for (auto const &known : m_ordered_copy_targets) {
++        if (target->same_copy_target(*known)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void db_copy_thread_t::thread_t::delete_from_ordered_copy_table(
++    db_cmd_copy_delete_t<db_deleter_by_id_t> &cmd)
++{
++    if (has_ordered_copy_table(cmd.target)) {
++        cmd.delete_data_from(fmt::format(R"("{}")",
++                                         cmd.target->ordered_copy_table()),
++                             m_db_connection);
++    }
++}
++
++void db_copy_thread_t::thread_t::delete_from_ordered_copy_table(
++    db_cmd_copy_delete_t<db_deleter_by_type_and_id_t> &cmd)
++{
++    if (has_ordered_copy_table(cmd.target)) {
++        cmd.delete_data_from(fmt::format(R"("{}")",
++                                         cmd.target->ordered_copy_table()),
++                             m_db_connection);
++    }
 +}
 +
 +void db_copy_thread_t::thread_t::drain_ordered_copy_table(
 +    std::shared_ptr<db_target_descr_t> const &target)
 +{
-+    bool found = false;
-+    for (auto const &known : m_ordered_copy_targets) {
-+        if (target->same_copy_target(*known)) {
-+            found = true;
-+            break;
-+        }
-+    }
-+    if (!found) {
++    if (!has_ordered_copy_table(target)) {
 +        return;
 +    }
 +
@@ -123,10 +150,10 @@ index 1a7dede..eda2881 100644
 +    }
 +}
 diff --git a/src/db-copy.hpp b/src/db-copy.hpp
-index 3a9d3f0..3bd921d 100644
+index 3a9d3f0..7b90bc8 100644
 --- a/src/db-copy.hpp
 +++ b/src/db-copy.hpp
-@@ -46,8 +46,29 @@ public:
+@@ -46,8 +46,41 @@ public:
      std::string const &name() const noexcept { return m_name; }
      std::string const &id() const noexcept { return m_id; }
      std::string const &rows() const noexcept { return m_rows; }
@@ -138,6 +165,10 @@ index 3a9d3f0..3bd921d 100644
 +    {
 +        return m_ordered_copy_table;
 +    }
++    std::string const &ordered_copy_delete_index_by() const noexcept
++    {
++        return m_ordered_copy_delete_index_by;
++    }
 
      void set_rows(std::string rows) { m_rows = std::move(rows); }
 +    void set_ordered_copy_by(std::string order_by)
@@ -148,26 +179,36 @@ index 3a9d3f0..3bd921d 100644
 +    {
 +        m_ordered_copy_table = std::move(table);
 +    }
++    void set_ordered_copy_delete_index_by(std::string columns)
++    {
++        m_ordered_copy_delete_index_by = std::move(columns);
++    }
 +
 +    bool uses_ordered_copy() const noexcept
 +    {
 +        return !m_ordered_copy_by.empty();
 +    }
++    bool has_ordered_copy_delete_index() const noexcept
++    {
++        return !m_ordered_copy_delete_index_by.empty();
++    }
 
      /**
       * Check if the buffer would use exactly the same copy operation.
-@@ -56,7 +77,9 @@ public:
+@@ -56,7 +89,11 @@ public:
      {
          return (this == &other) ||
                 (m_schema == other.m_schema && m_name == other.m_name &&
 -                m_id == other.m_id && m_rows == other.m_rows);
 +                m_id == other.m_id && m_rows == other.m_rows &&
 +                m_ordered_copy_by == other.m_ordered_copy_by &&
-+                m_ordered_copy_table == other.m_ordered_copy_table);
++                m_ordered_copy_table == other.m_ordered_copy_table &&
++                m_ordered_copy_delete_index_by ==
++                    other.m_ordered_copy_delete_index_by);
      }
 
  private:
-@@ -68,6 +91,10 @@ private:
+@@ -68,6 +105,12 @@ private:
      std::string m_id;
      /// Comma-separated list of rows for copy operation (when empty: all rows)
      std::string m_rows;
@@ -175,22 +216,45 @@ index 3a9d3f0..3bd921d 100644
 +    std::string m_ordered_copy_by;
 +    /// Temporary table name used for staged ordered COPY.
 +    std::string m_ordered_copy_table;
++    /// Optional index columns for fast DELETEs from a staged COPY table.
++    std::string m_ordered_copy_delete_index_by;
  };
 
  /**
-@@ -293,6 +320,11 @@ private:
+@@ -196,6 +239,14 @@ public:
+         }
+     }
+
++    void delete_data_from(std::string const &table,
++                          pg_conn_t const &db_connection)
++    {
++        if (m_deleter.has_data()) {
++            m_deleter.delete_rows(table, target->id(), db_connection);
++        }
++    }
++
+     template <typename... ARGS>
+     void add_deletable(ARGS &&...args)
+     {
+@@ -293,6 +344,17 @@ private:
 
          void start_copy(std::shared_ptr<db_target_descr_t> const &target);
          void finish_copy();
 +        void ensure_ordered_copy_table(
 +            std::shared_ptr<db_target_descr_t> const &target);
++        bool has_ordered_copy_table(
++            std::shared_ptr<db_target_descr_t> const &target) const;
++        void delete_from_ordered_copy_table(
++            db_cmd_copy_delete_t<db_deleter_by_id_t> &cmd);
++        void delete_from_ordered_copy_table(
++            db_cmd_copy_delete_t<db_deleter_by_type_and_id_t> &cmd);
 +        void drain_ordered_copy_table(
 +            std::shared_ptr<db_target_descr_t> const &target);
 +        void drain_ordered_copy_tables();
          void delete_rows(db_cmd_copy_t *buffer);
 
          connection_params_t m_connection_params;
-@@ -300,6 +332,7 @@ private:
+@@ -300,6 +362,7 @@ private:
 
          // Target for copy operation currently ongoing.
          std::shared_ptr<db_target_descr_t> m_inflight;
@@ -227,7 +291,7 @@ index 6b250a6..4b38667 100644
  }
 
 diff --git a/src/table.cpp b/src/table.cpp
-index 6b65eb9..67bf1cf 100644
+index 6b65eb9..6794fe5 100644
 --- a/src/table.cpp
 +++ b/src/table.cpp
 @@ -27,10 +27,11 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
@@ -244,7 +308,7 @@ index 6b65eb9..67bf1cf 100644
    m_hstore_columns(std::move(hstore_columns)), m_copy(copy_thread)
  {
      // if we dont have any columns
-@@ -39,13 +40,20 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
+@@ -39,13 +40,23 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
      }
 
      generate_copy_column_list();
@@ -252,6 +316,9 @@ index 6b65eb9..67bf1cf 100644
 +    if (m_cluster_during_import) {
 +        m_target->set_ordered_copy_by("osm2pgsql_cluster_key, osm_id");
 +        m_target->set_ordered_copy_table("osm2pgsql_ordered_copy_" + name);
++        if (m_append) {
++            m_target->set_ordered_copy_delete_index_by(m_target->id());
++        }
 +    }
  }
 
@@ -266,7 +333,7 @@ index 6b65eb9..67bf1cf 100644
    m_hstore_columns(other.m_hstore_columns), m_table_space(other.m_table_space),
    m_copy(copy_thread)
  {
-@@ -118,12 +126,28 @@ void table_t::start(connection_params_t const &connection_params,
+@@ -118,12 +129,28 @@ void table_t::start(connection_params_t const &connection_params,
              sql += "\"tags\" hstore,";
          }
 
@@ -298,7 +365,7 @@ index 6b65eb9..67bf1cf 100644
          //add the main table space
          sql += m_table_space;
 
-@@ -190,17 +214,38 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
+@@ -190,17 +217,38 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
                                      m_target->name());
          }
 
@@ -328,14 +395,14 @@ index 6b65eb9..67bf1cf 100644
 +                                  quoted_idx_name);
 +        } else {
 +            log_info("Clustering table '{}' by geometry...", m_target->name());
++
++            std::string const sql = fmt::format(
++                "CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
++                qual_tmp_name, m_table_space, qual_name);
 
 -        m_db_connection->exec("DROP TABLE {}", qual_name);
 -        m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")", qual_tmp_name,
 -                              m_target->name());
-+            std::string const sql = fmt::format(
-+                "CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
-+                qual_tmp_name, m_table_space, qual_name);
-+
 +            m_db_connection->exec(sql);
 +
 +            m_db_connection->exec("DROP TABLE {}", qual_name);
