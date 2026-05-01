@@ -51,8 +51,17 @@ spread those forced duplicate-key rows across multiple hot tile keys.  This
 keeps the original single-hot-key cliff visible while also exercising batches
 where several prefixes are hot at once, including the multi-hot cleanup path
 that is easy to miss with only tile `1`.
-When this value is greater than zero, locality output splits inserts into
-`insert_hot` for the forced duplicate-key rows and `insert_rest` for the
+Set `HOT_UPDATE_FRACTION_VALUES="0 0.9"` to also bias the enlarged update
+phase toward the configured hot tile range.  This is separate from
+`HOT_TILE_FRACTION_VALUES` because real diffs can have hot inserts, hot
+updates, both, or neither.  When the value is non-zero, locality output splits
+updates into `update_hot` and `update_rest`.
+Set `UPDATES_BEFORE_INSERTS_VALUES="false true"` to test whether applying
+enlarging updates before new-row inserts preserves more clustered reserve
+space for existing rows.  This is a workload-order diagnostic, not a PostgreSQL
+placement change.
+When `hot_tile_fraction` is greater than zero, locality output splits inserts
+into `insert_hot` for the forced duplicate-key rows and `insert_rest` for the
 remaining rows.  This keeps a hot-key cliff from being hidden by a small
 well-placed non-hot tail.
 The current all-equal batch guard deliberately treats a fully hot simple prefix
@@ -217,6 +226,18 @@ The companion `clustered_write_read_updated_hot` and
 `without_cluster_metadata_read_updated_hot` steps apply the same hot-range
 read shape to rows whose diff update bumped `version`, making moved-update
 read cost visible separately from the broader hot-tile read.
+
+A scale `1`, repeat `3`, single-key COPY run with
+`hot_tile_fraction=0.9`, `hot_tile_count=128`, and
+`HOT_UPDATE_FRACTION_VALUES="0 0.9"` showed why update-hot needs its own axis.
+At fillfactor `50`, ordinary updates stayed mostly local (`95.13%` inside the
+base range for clustered-write, `98.20%` for the control), while hot-biased
+updates split the result: `update_rest` stayed local (`99.97%`), but
+`update_hot` did not (`0%` clustered-write, `15.63%` control).  The clustered
+insert path still kept the non-hot inserted tail local (`96.90%`) while forced
+hot inserts remained a compact overflow/tail tradeoff.  Raw gzip output is
+under
+`/home/kom/tmp/clustered-write-synthetic/hot-update-fillfactor-20260501-041447/`.
 
 The wrapper runs the same SQL against `$DBNAME` (`postgres` by default), stores
 the raw `psql` output under `$OUTDIR/raw`, and writes `timings.tsv`,
@@ -764,6 +785,19 @@ Do not repeat these paths blindly:
   clustered versus `39.05/35.88 ms` control).  The code experiment was
   reverted; the update-focused read timing was kept.  Raw gzip output is under
   `/home/kom/tmp/clustered-write-synthetic/update-placement-proto-20260501-040654/`.
+* **Applying enlarged updates before new hot inserts:** rejected as a general
+  workload-order fix.  The new `UPDATES_BEFORE_INSERTS_VALUES` axis tested the
+  tempting osm2pgsql-style idea that existing rows should consume fillfactor
+  reserve before new duplicate-key rows arrive.  In the focused scale `1`,
+  repeat `3`, fillfactor `50`, `hot_tile_fraction=0.9`,
+  `hot_update_fraction=0.9`, `hot_tile_count=128`, COPY run, update-first did
+  improve clustered `update_hot` locality from `0%` to `15.63%`, but it moved
+  the damage into inserts: clustered `insert_hot` locality fell from `28.31%`
+  to `1.42%`, outside-base span grew from `304` to `1082` blocks, and
+  clustered insert median slowed from `204.08 ms` to `345.64 ms`.  The code
+  path is still useful as a diagnostic benchmark axis, but not as a fix by
+  itself.  Raw gzip output is under
+  `/home/kom/tmp/clustered-write-synthetic/update-before-ab-20260501-041913/`.
 * **Relying on ordered diff input as the non-hot cost fix:** rejected as a
   standalone answer.  A scale `1`, repeat `3`, single-key `hot=0` run with
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` kept the same locality shape
@@ -808,6 +842,10 @@ Important output columns:
   to stress duplicate-key placement over already-full equal-key pages.
 * `hot_tile_count`: number of tile keys used for the forced duplicate-key rows
   when `hot_tile_fraction` is non-zero.
+* `hot_update_fraction`: fraction of enlarged update rows biased toward the
+  configured hot tile range.
+* `updates_before_inserts`: whether the update phase ran before the insert
+  phase in this synthetic workload.
 * `order_diff_by_cluster_key`: whether the synthetic diff insert was explicitly
   ordered by `(tile_id, osm_id)` before insertion.
 * `copy_diff_from_file`: whether the insert diff used the server-side
@@ -816,8 +854,9 @@ Important output columns:
   staging step.
 * `variant`: either the clustered-write path or the in-script control without
   remembered clustered-index metadata.
-* `diff_kind`: `insert`/`update` normally, or `insert_hot`/`insert_rest` when
-  `hot_tile_fraction` is nonzero.
+* `diff_kind`: `insert`/`update` normally; `insert_hot`/`insert_rest` when
+  `hot_tile_fraction` is nonzero; and `update_hot`/`update_rest` when
+  `hot_update_fraction` is nonzero.
 * `step` and `elapsed_ms`: structured timing rows for the diff insert/update
   statements, emitted before the locality summary so runs can be compared
   without scraping `psql` timing chatter.

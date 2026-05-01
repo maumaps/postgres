@@ -30,6 +30,11 @@
 \set hot_tile_count 1
 \endif
 
+\if :{?hot_update_fraction}
+\else
+\set hot_update_fraction 0
+\endif
+
 \if :{?heap_fillfactor}
 \else
 \set heap_fillfactor 90
@@ -43,6 +48,11 @@
 \if :{?copy_diff_from_file}
 \else
 \set copy_diff_from_file false
+\endif
+
+\if :{?updates_before_inserts}
+\else
+\set updates_before_inserts false
 \endif
 
 \if :{?diff_copy_path}
@@ -66,9 +76,11 @@ select (200000 * :scale)::int as base_rows,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
+       (:hot_update_fraction)::numeric as hot_update_fraction,
        greatest(1, least((4096 * :scale)::int, (:hot_tile_count)::int)) as hot_tile_count,
        (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
-       (:'copy_diff_from_file')::boolean as copy_diff_from_file;
+       (:'copy_diff_from_file')::boolean as copy_diff_from_file,
+       (:'updates_before_inserts')::boolean as updates_before_inserts;
 
 create unlogged table clustered_write_osm_diff_on
 (
@@ -183,9 +195,11 @@ select (200000 * :scale)::int as base_rows,
        (:'text_cluster_key')::boolean as text_cluster_key,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
+       (:hot_update_fraction)::numeric as hot_update_fraction,
        greatest(1, least((4096 * :scale)::int, (:hot_tile_count)::int)) as hot_tile_count,
        (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
-       (:'copy_diff_from_file')::boolean as copy_diff_from_file;
+       (:'copy_diff_from_file')::boolean as copy_diff_from_file,
+       (:'updates_before_inserts')::boolean as updates_before_inserts;
 
 create temp table clustered_write_step_timings
 (
@@ -221,6 +235,50 @@ select s.base_rows + g as osm_id,
 from clustered_write_settings as s,
      generate_series(1, s.insert_rows) as g;
 
+create temp table clustered_write_diff_updates as
+with hot_candidates as
+(
+    select g as osm_id,
+           row_number() over (order by (g::bigint * 2654435761) % s.base_rows) as candidate_number
+    from clustered_write_settings as s,
+         generate_series(1, s.base_rows) as g
+    where ((g - 1) % s.tile_count) + 1 <= s.hot_tile_count
+),
+hot_updates as
+(
+    select h.osm_id,
+           true as is_hot_update
+    from hot_candidates as h
+    join clustered_write_settings as s on true
+    where h.candidate_number <= (s.update_rows * s.hot_update_fraction)::int
+),
+rest_candidates as
+(
+    select g as osm_id,
+           row_number() over (order by (g::bigint * 2654435761) % s.base_rows) as candidate_number
+    from clustered_write_settings as s,
+         generate_series(1, s.base_rows) as g
+    where s.hot_update_fraction = 0
+       or ((g - 1) % s.tile_count) + 1 > s.hot_tile_count
+),
+rest_updates as
+(
+    select r.osm_id,
+           false as is_hot_update
+    from rest_candidates as r
+    join clustered_write_settings as s on true
+    where r.candidate_number <= s.update_rows - (select count(*) from hot_updates)
+)
+select osm_id,
+       is_hot_update
+from hot_updates
+
+union all
+
+select osm_id,
+       is_hot_update
+from rest_updates;
+
 \if :copy_diff_from_file
 \if :order_diff_by_cluster_key
 copy (
@@ -240,6 +298,34 @@ copy (
     from clustered_write_diff_inserts as d
 ) to :'diff_copy_path' with (format csv, delimiter E'\t');
 \endif
+\endif
+
+\if :updates_before_inserts
+insert into clustered_write_step_timings
+values ('clustered_write_update', clock_timestamp(), null);
+
+update clustered_write_osm_diff_on as o
+set version = o.version + 1,
+    payload = repeat('updated-row', 64)
+from clustered_write_diff_updates as u
+where o.osm_id = u.osm_id;
+
+update clustered_write_step_timings
+set finished_at = clock_timestamp()
+where step = 'clustered_write_update';
+
+insert into clustered_write_step_timings
+values ('without_cluster_metadata_update', clock_timestamp(), null);
+
+update clustered_write_osm_diff_off as o
+set version = o.version + 1,
+    payload = repeat('updated-row', 64)
+from clustered_write_diff_updates as u
+where o.osm_id = u.osm_id;
+
+update clustered_write_step_timings
+set finished_at = clock_timestamp()
+where step = 'without_cluster_metadata_update';
 \endif
 
 insert into clustered_write_step_timings
@@ -300,11 +386,8 @@ update clustered_write_step_timings
 set finished_at = clock_timestamp()
 where step = 'without_cluster_metadata_insert';
 
-create temp table clustered_write_diff_updates as
-select distinct (((g::bigint * 2654435761) % s.base_rows) + 1)::bigint as osm_id
-from clustered_write_settings as s,
-     generate_series(1, s.update_rows) as g;
-
+\if :updates_before_inserts
+\else
 insert into clustered_write_step_timings
 values ('clustered_write_update', clock_timestamp(), null);
 
@@ -330,6 +413,7 @@ where o.osm_id = u.osm_id;
 update clustered_write_step_timings
 set finished_at = clock_timestamp()
 where step = 'without_cluster_metadata_update';
+\endif
 
 analyze clustered_write_osm_diff_on;
 analyze clustered_write_osm_diff_off;
@@ -475,12 +559,18 @@ with measured as
     union all
 
     select 'clustered_write'::text as variant,
-           'update'::text as diff_kind,
+           case
+             when s.hot_update_fraction > 0 and u.is_hot_update then 'update_hot'
+             when s.hot_update_fraction > 0 then 'update_rest'
+             else 'update'
+           end as diff_kind,
            pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_on as o
     join clustered_write_settings as s on true
+    join clustered_write_diff_updates as u
+      on u.osm_id = o.osm_id
     join clustered_write_base_ranges as r
       on r.variant = 'clustered_write'
      and r.tile_id = o.tile_id
@@ -510,12 +600,18 @@ with measured as
     union all
 
     select 'without_cluster_metadata'::text as variant,
-           'update'::text as diff_kind,
+           case
+             when s.hot_update_fraction > 0 and u.is_hot_update then 'update_hot'
+             when s.hot_update_fraction > 0 then 'update_rest'
+             else 'update'
+           end as diff_kind,
            pg_temp.tid_block(o.ctid) as heap_block,
            r.min_block,
            r.max_block
     from clustered_write_osm_diff_off as o
     join clustered_write_settings as s on true
+    join clustered_write_diff_updates as u
+      on u.osm_id = o.osm_id
     join clustered_write_base_ranges as r
       on r.variant = 'without_cluster_metadata'
      and r.tile_id = o.tile_id
