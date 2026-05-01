@@ -35,6 +35,11 @@
 \set hot_update_fraction 0
 \endif
 
+\if :{?update_payload_repeat}
+\else
+\set update_payload_repeat 64
+\endif
+
 \if :{?heap_fillfactor}
 \else
 \set heap_fillfactor 90
@@ -77,6 +82,7 @@ select (200000 * :scale)::int as base_rows,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
        (:hot_update_fraction)::numeric as hot_update_fraction,
+       (:update_payload_repeat)::int as update_payload_repeat,
        greatest(1, least((4096 * :scale)::int, (:hot_tile_count)::int)) as hot_tile_count,
        (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
        (:'copy_diff_from_file')::boolean as copy_diff_from_file,
@@ -196,6 +202,7 @@ select (200000 * :scale)::int as base_rows,
        (:heap_fillfactor)::int as heap_fillfactor,
        (:hot_tile_fraction)::numeric as hot_tile_fraction,
        (:hot_update_fraction)::numeric as hot_update_fraction,
+       (:update_payload_repeat)::int as update_payload_repeat,
        greatest(1, least((4096 * :scale)::int, (:hot_tile_count)::int)) as hot_tile_count,
        (:'order_diff_by_cluster_key')::boolean as order_diff_by_cluster_key,
        (:'copy_diff_from_file')::boolean as copy_diff_from_file,
@@ -306,8 +313,9 @@ values ('clustered_write_update', clock_timestamp(), null);
 
 update clustered_write_osm_diff_on as o
 set version = o.version + 1,
-    payload = repeat('updated-row', 64)
+    payload = repeat('updated-row', s.update_payload_repeat)
 from clustered_write_diff_updates as u
+join clustered_write_settings as s on true
 where o.osm_id = u.osm_id;
 
 update clustered_write_step_timings
@@ -319,8 +327,9 @@ values ('without_cluster_metadata_update', clock_timestamp(), null);
 
 update clustered_write_osm_diff_off as o
 set version = o.version + 1,
-    payload = repeat('updated-row', 64)
+    payload = repeat('updated-row', s.update_payload_repeat)
 from clustered_write_diff_updates as u
+join clustered_write_settings as s on true
 where o.osm_id = u.osm_id;
 
 update clustered_write_step_timings
@@ -393,8 +402,9 @@ values ('clustered_write_update', clock_timestamp(), null);
 
 update clustered_write_osm_diff_on as o
 set version = o.version + 1,
-    payload = repeat('updated-row', 64)
+    payload = repeat('updated-row', s.update_payload_repeat)
 from clustered_write_diff_updates as u
+join clustered_write_settings as s on true
 where o.osm_id = u.osm_id;
 
 update clustered_write_step_timings
@@ -406,8 +416,9 @@ values ('without_cluster_metadata_update', clock_timestamp(), null);
 
 update clustered_write_osm_diff_off as o
 set version = o.version + 1,
-    payload = repeat('updated-row', 64)
+    payload = repeat('updated-row', s.update_payload_repeat)
 from clustered_write_diff_updates as u
+join clustered_write_settings as s on true
 where o.osm_id = u.osm_id;
 
 update clustered_write_step_timings

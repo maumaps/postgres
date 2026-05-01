@@ -56,6 +56,11 @@ phase toward the configured hot tile range.  This is separate from
 `HOT_TILE_FRACTION_VALUES` because real diffs can have hot inserts, hot
 updates, both, or neither.  When the value is non-zero, locality output splits
 updates into `update_hot` and `update_rest`.
+Set `UPDATE_PAYLOAD_REPEAT_VALUES="8 16 32 64"` to change the size of the
+enlarged update payload.  This is a reserve-capacity diagnostic: if smaller
+updates stay local but larger updates do not, the issue is page free space; if
+both fail after hot inserts, the insert/update phase interaction is consuming
+or bypassing the useful reserve.
 Set `UPDATES_BEFORE_INSERTS_VALUES="false true"` to test whether applying
 enlarging updates before new-row inserts preserves more clustered reserve
 space for existing rows.  This is a workload-order diagnostic, not a PostgreSQL
@@ -809,6 +814,25 @@ Do not repeat these paths blindly:
   path is still useful as a diagnostic benchmark axis, but not as a fix by
   itself.  Raw gzip output is under
   `/home/kom/tmp/clustered-write-synthetic/update-before-ab-20260501-041913/`.
+* **Treating hot-update failure as only a payload-size problem:** rejected.
+  The `UPDATE_PAYLOAD_REPEAT_VALUES` axis separates moved-update reserve
+  capacity from the insert/update interaction.  In the scale `1`, repeat `2`,
+  fillfactor `50`, `hot_tile_fraction=0.9`, `hot_update_fraction=0.9`,
+  `hot_tile_count=128`, COPY run, the clustered table still kept `update_hot`
+  at `0%` inside the original base range for payload repeats `8`, `16`, `32`,
+  and `64` when hot inserts ran first.  The control showed that payload size
+  matters for ordinary heap behaviour (`87.50%`, `53.13%`, `31.25%`,
+  `15.63%` inside base as payload grew), but clustered hot inserts had already
+  made the useful reserve unavailable to later updates.  Reversing the phase
+  order with payload `8` restored clustered `update_hot` to `87.50%`, while
+  clustered `insert_hot` fell from `28.31%` to `0%`; payload `64` repeated the
+  earlier partial update win (`15.63%`) and insert regression (`1.42%`).  So
+  the next fix should not merely shrink payloads or reorder phases; it needs a
+  policy that preserves update reserve while keeping duplicate-key insert
+  overflow compact.  Raw gzip outputs are under
+  `/home/kom/tmp/clustered-write-synthetic/update-payload-hot-matrix-20260501-132655/`
+  and
+  `/home/kom/tmp/clustered-write-synthetic/update-payload-before-after-20260501-132803/`.
 * **Relying on ordered diff input as the non-hot cost fix:** rejected as a
   standalone answer.  A scale `1`, repeat `3`, single-key `hot=0` run with
   `ORDER_DIFF_BY_CLUSTER_KEY_VALUES="false true"` kept the same locality shape
@@ -855,6 +879,9 @@ Important output columns:
   when `hot_tile_fraction` is non-zero.
 * `hot_update_fraction`: fraction of enlarged update rows biased toward the
   configured hot tile range.
+* `update_payload_repeat`: multiplier for the `updated-row` payload used by
+  enlarged updates.  Lower values test whether fillfactor reserve is sufficient
+  when moved rows are small; higher values stress reserve exhaustion.
 * `updates_before_inserts`: whether the update phase ran before the insert
   phase in this synthetic workload.
 * `order_diff_by_cluster_key`: whether the synthetic diff insert was explicitly
@@ -871,6 +898,10 @@ Important output columns:
 * `step` and `elapsed_ms`: structured timing rows for the diff insert/update
   statements, emitted before the locality summary so runs can be compared
   without scraping `psql` timing chatter.
+* `avg_rows_measured`: average number of rows behind the locality row in
+  `locality_summary.tsv`.  This is important for hot-update runs because the
+  configured fraction can be capped by the number of base rows that actually
+  belong to the hot tile range.
 * `avg_elapsed_ms`, `median_elapsed_ms`, `min_elapsed_ms`, `max_elapsed_ms`:
   aggregate timing columns in `timing_summary.tsv`; prefer the median when the
   run environment shows high load or a small number of outliers.
