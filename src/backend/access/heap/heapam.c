@@ -31,6 +31,10 @@
  */
 #include "postgres.h"
 
+#include "common/hashfn.h"
+#include "access/genam.h"
+#include "access/gist.h"
+#include "access/gist_private.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/hio.h"
@@ -40,8 +44,11 @@
 #include "access/valid.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
 #include "executor/instrument_node.h"
 #include "pgstat.h"
@@ -53,12 +60,82 @@
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/relcache.h"
+#include "utils/sortsupport.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+
+typedef struct HeapTupleClusteredWriteItem
+{
+	HeapTuple	tuple;
+	BlockNumber targetBlock;
+	Datum		clusterValues[INDEX_MAX_KEYS];
+	bool		clusterIsNull[INDEX_MAX_KEYS];
+	bool		hasClusterKey;
+	int			inputIndex;
+} HeapTupleClusteredWriteItem;
+
+typedef struct HeapTupleClusteredSortContext
+{
+	int			nkeys;
+	SortSupportData sortKeys[INDEX_MAX_KEYS];
+
+	/* GiST compressed keys must survive until qsort finishes. */
+	MemoryContext sortCxt;
+
+	/* Comparator support functions should not leak into the caller context. */
+	MemoryContext compareCxt;
+} HeapTupleClusteredSortContext;
+
+typedef struct HeapTupleClusteredTargetCacheEntry
+{
+	Datum		prefixValue;
+	BlockNumber targetBlock;
+	bool		occupied;
+} HeapTupleClusteredTargetCacheEntry;
+
+typedef struct HeapTupleClusteredPrefixCountEntry
+{
+	Datum		prefixValue;
+	int			ntuples;
+	bool		occupied;
+} HeapTupleClusteredPrefixCountEntry;
+
+/*
+ * COPY currently feeds heap_multi_insert() in batches of up to 1000 tuples. A
+ * small direct-mapped hash table gives by-value leading keys, such as OSM tile
+ * ids, cheap repeated target lookups.  Collisions only cause cache misses or
+ * evictions: every hit is still verified by the clustered index opfamily's
+ * equality function before reusing the target block.
+ */
+#define CLUSTERED_WRITE_PREFIX_TARGET_HASH_FACTOR	4
+
+/*
+ * Very hot leading keys are a bad fit for clustered probing: the batch will
+ * have to spill across many heap pages anyway, and repeatedly anchoring on the
+ * same old page can dominate insertion time.  Keep normal OSM-style tile
+ * grouping clustered, but let very dense equal-prefix runs use the regular
+ * bulk/FSM path.
+ */
+#define CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES	16
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
+static int	heap_clustered_write_item_cmp(const void *a, const void *b, void *arg);
+static bool heap_clustered_write_prefix_can_compare_all_equal(Oid typeOid);
+static bool heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid);
+static bool heap_clustered_write_prefix_can_hash(Oid typeOid);
+static uint32 heap_clustered_write_prefix_hash(Datum value, Oid typeOid);
+static bool heap_clustered_write_index_can_sort(Relation relation,
+												Relation indexRelation);
+static int	heap_prepare_clustered_write_sort(Relation relation,
+											  Relation indexRelation,
+											  HeapTupleClusteredWriteItem *items,
+											  int ntuples,
+											  HeapTupleClusteredSortContext *context);
 static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  Buffer newbuf, HeapTuple oldtup,
 								  HeapTuple newtup, HeapTuple old_key_tuple,
@@ -111,6 +188,254 @@ static int	bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
 static HeapTuple ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
 										bool *copy);
+
+static int
+heap_clustered_write_item_cmp(const void *a, const void *b, void *arg)
+{
+	const HeapTupleClusteredWriteItem *left = (const HeapTupleClusteredWriteItem *) a;
+	const HeapTupleClusteredWriteItem *right = (const HeapTupleClusteredWriteItem *) b;
+	HeapTupleClusteredSortContext *context = (HeapTupleClusteredSortContext *) arg;
+
+	if (context != NULL && context->nkeys > 0 &&
+		left->hasClusterKey && right->hasClusterKey)
+	{
+		for (int i = 0; i < context->nkeys; i++)
+		{
+			int			compare;
+			MemoryContext oldcontext;
+
+			oldcontext = MemoryContextSwitchTo(context->compareCxt);
+			compare = ApplySortComparator(left->clusterValues[i],
+										  left->clusterIsNull[i],
+										  right->clusterValues[i],
+										  right->clusterIsNull[i],
+										  &context->sortKeys[i]);
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextReset(context->compareCxt);
+
+			if (compare != 0)
+				return compare;
+		}
+	}
+	else if (left->hasClusterKey && !right->hasClusterKey)
+		return -1;
+	else if (!left->hasClusterKey && right->hasClusterKey)
+		return 1;
+
+	if (left->targetBlock == InvalidBlockNumber &&
+		right->targetBlock != InvalidBlockNumber)
+		return 1;
+	if (left->targetBlock != InvalidBlockNumber &&
+		right->targetBlock == InvalidBlockNumber)
+		return -1;
+	if (left->targetBlock < right->targetBlock)
+		return -1;
+	if (left->targetBlock > right->targetBlock)
+		return 1;
+
+	if (left->inputIndex < right->inputIndex)
+		return -1;
+	if (left->inputIndex > right->inputIndex)
+		return 1;
+	return 0;
+}
+
+static bool
+heap_clustered_write_prefix_can_compare_all_equal(Oid typeOid)
+{
+	if (heap_clustered_write_prefix_can_compare_by_datum(typeOid))
+		return true;
+
+	switch (typeOid)
+	{
+		case TEXTOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+heap_clustered_write_prefix_can_compare_by_datum(Oid typeOid)
+{
+	if (!get_typbyval(typeOid))
+		return false;
+
+	switch (typeOid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case OIDOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+heap_clustered_write_prefix_can_hash(Oid typeOid)
+{
+	if (get_typbyval(typeOid))
+		return true;
+
+	switch (typeOid)
+	{
+		case TEXTOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint32
+heap_clustered_write_prefix_hash(Datum value, Oid typeOid)
+{
+	if (get_typbyval(typeOid))
+		return hash_bytes((unsigned char *) &value, sizeof(Datum));
+
+	switch (typeOid)
+	{
+		case TEXTOID:
+			{
+				struct varlena *text = (struct varlena *)
+					PG_DETOAST_DATUM_PACKED(value);
+				uint32		hash;
+
+				/*
+				 * This hash only selects a direct-mapped cache slot.  Callers
+				 * still verify hits with the clustered index equality operator,
+				 * so different payloads can only cause cache misses or evictions.
+				 */
+				hash = hash_bytes((unsigned char *) VARDATA_ANY(text),
+								  VARSIZE_ANY_EXHDR(text));
+				if ((Pointer) text != DatumGetPointer(value))
+					pfree(text);
+				return hash;
+			}
+		default:
+			pg_unreachable();
+	}
+}
+
+static bool
+heap_clustered_write_index_can_sort(Relation relation, Relation indexRelation)
+{
+	int			natts;
+	int			nkeys;
+
+	if (IsBootstrapProcessingMode() || indexRelation == NULL)
+		return false;
+
+	if (indexRelation->rd_index->indrelid != RelationGetRelid(relation) ||
+		indexRelation->rd_rel->relam != GIST_AM_OID ||
+		!indexRelation->rd_indam->amclusterable ||
+		!indexRelation->rd_index->indisvalid ||
+		!indexRelation->rd_index->indisready ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indexprs, NULL) ||
+		!heap_attisnull(indexRelation->rd_indextuple,
+						Anum_pg_index_indpred, NULL))
+		return false;
+
+	natts = IndexRelationGetNumberOfAttributes(indexRelation);
+	nkeys = IndexRelationGetNumberOfKeyAttributes(indexRelation);
+	if (nkeys <= 0 || nkeys > natts || natts > INDEX_MAX_KEYS)
+		return false;
+
+	for (int i = 0; i < natts; i++)
+	{
+		if (indexRelation->rd_index->indkey.values[i] <= 0)
+			return false;
+
+		if (i < nkeys &&
+			!OidIsValid(index_getprocid(indexRelation, i + 1,
+										GIST_SORTSUPPORT_PROC)))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Prepare per-batch ordering by the remembered clustered key.
+ *
+ * GiST opclasses can participate when they provide the sort support function
+ * used by sorted GiST index builds; compress values first so the comparator
+ * sees the same representation as the GiST build tuplesort path.  The
+ * target-block probe remains the fallback for btree and other AMs.
+ */
+static int
+heap_prepare_clustered_write_sort(Relation relation,
+								  Relation indexRelation,
+								  HeapTupleClusteredWriteItem *items,
+								  int ntuples,
+								  HeapTupleClusteredSortContext *context)
+{
+	GISTSTATE  *giststate = NULL;
+	MemoryContext oldcontext;
+	int			natts;
+	int			nkeys;
+
+	context->nkeys = 0;
+	context->sortCxt = NULL;
+	context->compareCxt = NULL;
+
+	if (!heap_clustered_write_index_can_sort(relation, indexRelation))
+		return 0;
+
+	natts = IndexRelationGetNumberOfAttributes(indexRelation);
+	nkeys = IndexRelationGetNumberOfKeyAttributes(indexRelation);
+	context->sortCxt = AllocSetContextCreate(CurrentMemoryContext,
+											 "heap clustered write sort",
+											 ALLOCSET_DEFAULT_SIZES);
+	context->compareCxt = AllocSetContextCreate(context->sortCxt,
+												"heap clustered write compare",
+												ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(context->sortCxt);
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		SortSupport sortKey = &context->sortKeys[i];
+
+		memset(sortKey, 0, sizeof(SortSupportData));
+		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_collation = indexRelation->rd_indcollation[i];
+		sortKey->ssup_nulls_first = false;
+		sortKey->ssup_attno = i + 1;
+		sortKey->abbreviate = false;
+
+		PrepareSortSupportFromGistIndexRel(indexRelation, sortKey);
+	}
+
+	giststate = initGISTstate(indexRelation);
+	giststate->tempCxt = context->sortCxt;
+
+	for (int i = 0; i < ntuples; i++)
+	{
+		items[i].hasClusterKey = true;
+
+		for (int key = 0; key < natts; key++)
+		{
+			AttrNumber	attnum = indexRelation->rd_index->indkey.values[key];
+
+			items[i].clusterValues[key] =
+				heap_getattr(items[i].tuple, attnum, relation->rd_att,
+							 &items[i].clusterIsNull[key]);
+		}
+
+		gistCompressValues(giststate, indexRelation,
+						   items[i].clusterValues,
+						   items[i].clusterIsNull, true,
+						   items[i].clusterValues);
+	}
+
+	context->nkeys = nkeys;
+	freeGISTstate(giststate);
+	MemoryContextSwitchTo(oldcontext);
+
+	return nkeys;
+}
 
 
 /*
@@ -2030,6 +2355,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * this will also pin the requisite visibility map page.
 	 */
 	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
+									   heaptup,
+									   InvalidBlockNumber,
 									   InvalidBuffer, options, bistate,
 									   &vmbuffer, NULL,
 									   0);
@@ -2284,6 +2611,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 {
 	TransactionId xid = GetCurrentTransactionId();
 	HeapTuple  *heaptuples;
+	int		   *heaptuple_slot_indexes = NULL;
+	BlockNumber *heaptuple_clustered_target_blocks = NULL;
+	bool		heaptuple_skip_clustered_target_lookup = false;
 	int			i;
 	int			ndone;
 	PGAlignedBlock scratch;
@@ -2320,6 +2650,520 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	}
 
 	/*
+	 * Clustered multi-inserts work best when tuples targeting the same
+	 * already-clustered heap area are adjacent.  Compute candidate blocks
+	 * before entering the critical insertion loop, then keep tuples without a
+	 * clustered-index target in input order behind the clustered groups.
+	 */
+	if ((options & HEAP_INSERT_SKIP_FSM) == 0 && ntuples > 1)
+	{
+		HeapTupleClusteredWriteItem *clustered;
+		HeapTupleClusteredSortContext sortContext = {0};
+		Oid			clusteredIndexOid = InvalidOid;
+		Relation	clusteredIndexRelation = NULL;
+		bool		use_clustered_target_probe = false;
+		bool		use_clustered_sort = false;
+		bool		has_clustered_target = false;
+		bool		has_clustered_sort = false;
+		bool		has_skipped_clustered_target_probe = false;
+		AttrNumber	prefixCacheAttnum = InvalidAttrNumber;
+		Oid			prefixCacheCollation = InvalidOid;
+		RegProcedure prefixCacheEqProc = InvalidOid;
+		HeapTupleClusteredTargetCacheEntry *prefixTargetCache = NULL;
+		HeapTupleClusteredPrefixCountEntry *prefixCountCache = NULL;
+		int		   *prefixCountSlots = NULL;
+		MemoryContext prefixCacheCompareCxt = NULL;
+		bool		usePrefixHashCache = false;
+		int			prefixTargetCacheLimit = 0;
+		int			prefixTargetCacheSize = 0;
+		int			prefixCountCacheSize = 0;
+		int			prefixTargetCacheMask = 0;
+		int			hotPrefixTupleCount = 0;
+
+		if (!IsBootstrapProcessingMode())
+		{
+			clusteredIndexOid = RelationGetClusteredIndex(relation);
+			if (OidIsValid(clusteredIndexOid))
+				clusteredIndexRelation =
+					try_index_open(clusteredIndexOid, AccessShareLock);
+		}
+		if (RelationCanUseClusteredTargetProbe(relation,
+											   clusteredIndexRelation))
+			use_clustered_target_probe = true;
+		else if (heap_clustered_write_index_can_sort(relation,
+													 clusteredIndexRelation))
+			use_clustered_sort = true;
+
+		if (use_clustered_target_probe || use_clustered_sort)
+		{
+			/*
+			 * Clustered btree indexes commonly group many batch tuples by
+			 * their leading key.  For single-column indexes this is the exact
+			 * clustered key; for composite indexes the trailing key can be a
+			 * new object id.  A small per-batch cache avoids repeating the same
+			 * anchored probe for every tuple in that group.  The equality
+			 * function may detoast or allocate, so comparisons run in a
+			 * resettable context.
+			 */
+			if (use_clustered_target_probe)
+			{
+				Oid			eqOperator;
+
+				prefixCacheAttnum =
+					clusteredIndexRelation->rd_index->indkey.values[0];
+				prefixCacheCollation =
+					clusteredIndexRelation->rd_indcollation[0];
+				eqOperator =
+					get_opfamily_member(clusteredIndexRelation->rd_opfamily[0],
+										clusteredIndexRelation->rd_opcintype[0],
+										clusteredIndexRelation->rd_opcintype[0],
+										BTEqualStrategyNumber);
+				if (OidIsValid(eqOperator))
+					prefixCacheEqProc = get_opcode(eqOperator);
+				if (prefixCacheAttnum <= 0 ||
+					!RegProcedureIsValid(prefixCacheEqProc))
+					prefixCacheAttnum = InvalidAttrNumber;
+				else
+				{
+					/*
+					 * Very hot simple prefixes do not need the full prefix
+					 * cache machinery.  If the whole COPY batch has the same
+					 * simple key, skip clustered placement before allocating
+					 * the cache and take the regular bulk/FSM path instead.
+					 */
+					if (heap_clustered_write_prefix_can_compare_all_equal(
+							clusteredIndexRelation->rd_opcintype[0]))
+					{
+						Datum		firstPrefixValue;
+						Datum		lastPrefixValue;
+						bool		firstPrefixIsNull;
+						bool		lastPrefixIsNull;
+						bool		allSamePrefix = false;
+						bool		comparePrefixByDatum;
+
+						comparePrefixByDatum =
+							heap_clustered_write_prefix_can_compare_by_datum(
+								clusteredIndexRelation->rd_opcintype[0]);
+
+						firstPrefixValue =
+							heap_getattr(heaptuples[0],
+										 prefixCacheAttnum,
+										 relation->rd_att,
+										 &firstPrefixIsNull);
+						lastPrefixValue =
+							heap_getattr(heaptuples[ntuples - 1],
+										 prefixCacheAttnum,
+										 relation->rd_att,
+										 &lastPrefixIsNull);
+
+						if (!firstPrefixIsNull && !lastPrefixIsNull)
+						{
+							if (comparePrefixByDatum)
+								allSamePrefix =
+									firstPrefixValue == lastPrefixValue;
+							else
+							{
+								MemoryContext oldcontext;
+
+								prefixCacheCompareCxt =
+									AllocSetContextCreate(CurrentMemoryContext,
+														  "clustered hot prefix compare",
+														  ALLOCSET_DEFAULT_SIZES);
+								oldcontext =
+									MemoryContextSwitchTo(prefixCacheCompareCxt);
+								allSamePrefix =
+									DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																	  prefixCacheCollation,
+																	  firstPrefixValue,
+																	  lastPrefixValue));
+								MemoryContextSwitchTo(oldcontext);
+								MemoryContextReset(prefixCacheCompareCxt);
+							}
+
+							if (allSamePrefix)
+							{
+								for (i = 1; i < ntuples - 1; i++)
+								{
+									Datum		prefixValue;
+									bool		prefixIsNull;
+
+									prefixValue =
+										heap_getattr(heaptuples[i],
+													 prefixCacheAttnum,
+													 relation->rd_att,
+													 &prefixIsNull);
+									if (prefixIsNull)
+									{
+										allSamePrefix = false;
+										break;
+									}
+
+									if (comparePrefixByDatum)
+									{
+										if (prefixValue != firstPrefixValue)
+										{
+											allSamePrefix = false;
+											break;
+										}
+									}
+									else
+									{
+										MemoryContext oldcontext;
+
+										oldcontext =
+											MemoryContextSwitchTo(prefixCacheCompareCxt);
+										allSamePrefix =
+											DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																			  prefixCacheCollation,
+																			  firstPrefixValue,
+																			  prefixValue));
+										MemoryContextSwitchTo(oldcontext);
+										MemoryContextReset(prefixCacheCompareCxt);
+
+										if (!allSamePrefix)
+											break;
+									}
+								}
+							}
+						}
+
+						if (allSamePrefix &&
+							ntuples >
+							CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES)
+							hotPrefixTupleCount = ntuples;
+					}
+
+					if (hotPrefixTupleCount == ntuples)
+						goto skip_clustered_prefix_cache;
+
+					prefixTargetCacheLimit =
+						pg_nextpower2_32(Max(16,
+											 ntuples *
+											 CLUSTERED_WRITE_PREFIX_TARGET_HASH_FACTOR));
+					usePrefixHashCache =
+						heap_clustered_write_prefix_can_hash(
+							clusteredIndexRelation->rd_opcintype[0]);
+
+					if (!usePrefixHashCache)
+						prefixTargetCacheLimit = ntuples;
+					prefixTargetCache =
+						palloc0_array(HeapTupleClusteredTargetCacheEntry,
+									  prefixTargetCacheLimit);
+					prefixCountCache =
+						palloc0_array(HeapTupleClusteredPrefixCountEntry,
+									  prefixTargetCacheLimit);
+					prefixCountSlots = palloc_array(int, ntuples);
+					for (i = 0; i < ntuples; i++)
+						prefixCountSlots[i] = -1;
+					prefixTargetCacheMask = prefixTargetCacheLimit - 1;
+					if (prefixCacheCompareCxt == NULL)
+						prefixCacheCompareCxt =
+							AllocSetContextCreate(CurrentMemoryContext,
+												  "clustered target cache compare",
+												  ALLOCSET_DEFAULT_SIZES);
+
+					for (i = 0; i < ntuples; i++)
+					{
+						Datum		prefixValue;
+						bool		prefixIsNull;
+						bool		foundCount = false;
+						int			prefixCacheSlot = -1;
+						int			ncacheEntries;
+
+						prefixValue =
+							heap_getattr(heaptuples[i],
+										 prefixCacheAttnum,
+										 relation->rd_att,
+										 &prefixIsNull);
+						if (prefixIsNull)
+							continue;
+
+						if (usePrefixHashCache)
+						{
+							uint32		prefixHash;
+
+							prefixHash =
+								heap_clustered_write_prefix_hash(prefixValue,
+																 clusteredIndexRelation->rd_opcintype[0]);
+							prefixCacheSlot =
+								prefixHash & prefixTargetCacheMask;
+							ncacheEntries =
+								prefixCountCache[prefixCacheSlot].occupied ?
+								1 : 0;
+						}
+						else
+							ncacheEntries = prefixCountCacheSize;
+
+						for (int j = 0; j < ncacheEntries; j++)
+						{
+							bool		equal;
+							MemoryContext oldcontext;
+							int			cacheSlot;
+
+							cacheSlot = usePrefixHashCache ?
+								prefixCacheSlot : j;
+
+							oldcontext =
+								MemoryContextSwitchTo(prefixCacheCompareCxt);
+							equal =
+								DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																  prefixCacheCollation,
+																  prefixCountCache[cacheSlot].prefixValue,
+																  prefixValue));
+							MemoryContextSwitchTo(oldcontext);
+							MemoryContextReset(prefixCacheCompareCxt);
+
+							if (equal)
+							{
+								prefixCountCache[cacheSlot].ntuples++;
+								prefixCountSlots[i] = cacheSlot;
+								foundCount = true;
+								break;
+							}
+						}
+
+						if (!foundCount)
+						{
+							int			cacheSlot;
+
+							if (usePrefixHashCache)
+							{
+								cacheSlot = prefixCacheSlot;
+								if (prefixCountCache[cacheSlot].occupied)
+									continue;
+							}
+							else
+							{
+								Assert(prefixCountCacheSize <
+									   prefixTargetCacheLimit);
+								cacheSlot = prefixCountCacheSize++;
+							}
+
+							prefixCountCache[cacheSlot].prefixValue =
+								prefixValue;
+							prefixCountCache[cacheSlot].ntuples = 1;
+							prefixCountCache[cacheSlot].occupied = true;
+							prefixCountSlots[i] = cacheSlot;
+						}
+					}
+
+					if (prefixCountCache != NULL)
+					{
+						int			ncountSlots = usePrefixHashCache ?
+							prefixTargetCacheLimit : prefixCountCacheSize;
+
+						for (i = 0; i < ncountSlots; i++)
+						{
+							if (prefixCountCache[i].occupied &&
+								prefixCountCache[i].ntuples >
+								CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES)
+								hotPrefixTupleCount +=
+									prefixCountCache[i].ntuples;
+						}
+					}
+				}
+			}
+
+skip_clustered_prefix_cache:
+
+			if (use_clustered_target_probe &&
+				hotPrefixTupleCount == ntuples)
+			{
+				heaptuple_skip_clustered_target_lookup = true;
+				clustered = NULL;
+				if (prefixCacheCompareCxt != NULL)
+				{
+					MemoryContextDelete(prefixCacheCompareCxt);
+					prefixCacheCompareCxt = NULL;
+				}
+			}
+			else
+			{
+				clustered = palloc_array(HeapTupleClusteredWriteItem, ntuples);
+				for (i = 0; i < ntuples; i++)
+				{
+					clustered[i].tuple = heaptuples[i];
+					clustered[i].hasClusterKey = false;
+					clustered[i].targetBlock = InvalidBlockNumber;
+					if (use_clustered_target_probe)
+					{
+						BlockNumber targetBlock;
+						Datum		prefixValue = (Datum) 0;
+						bool		prefixIsNull = true;
+						bool		foundCachedTarget = false;
+						bool		skipClusteredTargetProbe = false;
+						int			prefixCacheSlot = -1;
+
+						if (prefixTargetCache != NULL)
+						{
+							if (prefixCountSlots != NULL &&
+								prefixCountSlots[i] >= 0)
+							{
+								int			countSlot = prefixCountSlots[i];
+
+								skipClusteredTargetProbe =
+									prefixCountCache[countSlot].ntuples >
+									CLUSTERED_WRITE_MAX_PREFIX_TARGET_TUPLES;
+							}
+
+							if (!skipClusteredTargetProbe)
+							{
+								prefixValue =
+									heap_getattr(heaptuples[i],
+												 prefixCacheAttnum,
+												 relation->rd_att,
+												 &prefixIsNull);
+							}
+							if (!prefixIsNull && !skipClusteredTargetProbe)
+							{
+								int			ncacheEntries;
+
+								if (usePrefixHashCache)
+								{
+									uint32		prefixHash;
+
+									prefixHash =
+										heap_clustered_write_prefix_hash(prefixValue,
+																		 clusteredIndexRelation->rd_opcintype[0]);
+									prefixCacheSlot =
+										prefixHash & prefixTargetCacheMask;
+									ncacheEntries =
+										prefixTargetCache[prefixCacheSlot].occupied ?
+										1 : 0;
+								}
+								else
+									ncacheEntries = prefixTargetCacheSize;
+
+								for (int j = 0; j < ncacheEntries; j++)
+								{
+									bool		equal;
+									MemoryContext oldcontext;
+									int			cacheSlot;
+
+									cacheSlot = usePrefixHashCache ?
+										prefixCacheSlot : j;
+
+									oldcontext =
+										MemoryContextSwitchTo(prefixCacheCompareCxt);
+									equal =
+										DatumGetBool(OidFunctionCall2Coll(prefixCacheEqProc,
+																		  prefixCacheCollation,
+																		  prefixTargetCache[cacheSlot].prefixValue,
+																		  prefixValue));
+									MemoryContextSwitchTo(oldcontext);
+									MemoryContextReset(prefixCacheCompareCxt);
+
+									if (equal)
+									{
+										clustered[i].targetBlock =
+											prefixTargetCache[cacheSlot].targetBlock;
+										foundCachedTarget = true;
+										break;
+									}
+								}
+							}
+						}
+						if (skipClusteredTargetProbe)
+							has_skipped_clustered_target_probe = true;
+
+						if (!foundCachedTarget && !skipClusteredTargetProbe)
+						{
+							if (RelationGetClusteredTargetBlocksFromIndex(relation,
+																		  clusteredIndexRelation,
+																		  heaptuples[i],
+																		  heaptuples[i]->t_len,
+																		  &targetBlock,
+																		  1,
+																		  true,
+																		  NULL) > 0)
+								clustered[i].targetBlock = targetBlock;
+
+							if (prefixTargetCache != NULL && !prefixIsNull)
+							{
+								int			cacheSlot;
+
+								if (usePrefixHashCache)
+									cacheSlot = prefixCacheSlot;
+								else
+								{
+									Assert(prefixTargetCacheSize <
+										   prefixTargetCacheLimit);
+									cacheSlot = prefixTargetCacheSize++;
+								}
+
+								prefixTargetCache[cacheSlot].prefixValue =
+									prefixValue;
+								prefixTargetCache[cacheSlot].targetBlock =
+									clustered[i].targetBlock;
+								prefixTargetCache[cacheSlot].occupied = true;
+							}
+						}
+					}
+					clustered[i].inputIndex = i;
+					if (clustered[i].targetBlock != InvalidBlockNumber)
+						has_clustered_target = true;
+				}
+			}
+
+			if (use_clustered_sort && clustered != NULL)
+				has_clustered_sort =
+					heap_prepare_clustered_write_sort(relation,
+													  clusteredIndexRelation,
+													  clustered, ntuples,
+													  &sortContext) > 0;
+
+			if (has_clustered_target || has_clustered_sort)
+			{
+				heaptuple_slot_indexes = palloc_array(int, ntuples);
+				heaptuple_clustered_target_blocks =
+					palloc_array(BlockNumber, ntuples);
+				qsort_arg(clustered, ntuples,
+						  sizeof(HeapTupleClusteredWriteItem),
+						  heap_clustered_write_item_cmp,
+						  has_clustered_sort ? &sortContext : NULL);
+				for (i = 0; i < ntuples; i++)
+				{
+					heaptuples[i] = clustered[i].tuple;
+					heaptuple_slot_indexes[i] = clustered[i].inputIndex;
+					heaptuple_clustered_target_blocks[i] =
+						clustered[i].targetBlock;
+				}
+				if (sortContext.sortCxt != NULL)
+					MemoryContextDelete(sortContext.sortCxt);
+			}
+			else if (has_skipped_clustered_target_probe)
+			{
+				/*
+				 * Dense equal-prefix batches intentionally skipped the
+				 * precomputed clustered target probe.  Keep the actual insert
+				 * on the regular bulk/FSM path too, without materializing a
+				 * per-tuple InvalidBlockNumber array solely to suppress lazy
+				 * clustered lookups in RelationGetBufferForTuple().
+				 */
+				heaptuple_skip_clustered_target_lookup = true;
+				if (sortContext.sortCxt != NULL)
+					MemoryContextDelete(sortContext.sortCxt);
+			}
+			else if (sortContext.sortCxt != NULL)
+				MemoryContextDelete(sortContext.sortCxt);
+
+			if (clustered != NULL)
+				pfree(clustered);
+			if (prefixTargetCache != NULL)
+			{
+				pfree(prefixCountSlots);
+				pfree(prefixCountCache);
+				pfree(prefixTargetCache);
+				if (prefixCacheCompareCxt != NULL)
+					MemoryContextDelete(prefixCacheCompareCxt);
+			}
+		}
+
+		if (clusteredIndexRelation != NULL)
+			index_close(clusteredIndexRelation, AccessShareLock);
+	}
+
+	/*
 	 * We're about to do the actual inserts -- but check for conflict first,
 	 * to minimize the possibility of having to roll back work we've just
 	 * done.
@@ -2348,6 +3192,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	while (ndone < ntuples)
 	{
 		Buffer		buffer;
+		HeapTuple	clustered_target_tuple = heaptuples[ndone];
+		BlockNumber clustered_target_block = InvalidBlockNumber;
+		uint32		buffer_options = options;
 		bool		all_visible_cleared = false;
 		bool		all_frozen_set = false;
 		int			nthispage;
@@ -2380,8 +3227,31 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 * Also pin visibility map page if COPY FREEZE inserts tuples into an
 		 * empty page. See all_frozen_set below.
 		 */
+		if (heaptuple_skip_clustered_target_lookup)
+		{
+			clustered_target_tuple = NULL;
+
+			/*
+			 * This COPY batch was already classified as too dense for
+			 * clustered target probing.  Do not ask the FSM for old pages
+			 * either: those pages are likely fillfactor reserve that should
+			 * stay available for future updates, and scanning them just adds
+			 * work before the dense run appends anyway.
+			 */
+			buffer_options |= HEAP_INSERT_SKIP_FSM;
+		}
+		else if (heaptuple_clustered_target_blocks != NULL)
+		{
+			clustered_target_block =
+				heaptuple_clustered_target_blocks[ndone];
+			if (clustered_target_block == InvalidBlockNumber)
+				clustered_target_tuple = NULL;
+		}
+
 		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
-										   InvalidBuffer, options, bistate,
+										   clustered_target_tuple,
+										   clustered_target_block,
+										   InvalidBuffer, buffer_options, bistate,
 										   &vmbuffer, NULL,
 										   npages - npages_used);
 		page = BufferGetPage(buffer);
@@ -2414,6 +3284,35 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		for (nthispage = 1; ndone + nthispage < ntuples; nthispage++)
 		{
 			HeapTuple	heaptup = heaptuples[ndone + nthispage];
+
+			/*
+			 * Clustered batch sorting groups tuples by a precomputed target
+			 * block, but the normal multi-insert page packer would otherwise
+			 * keep filling the first selected page with later tuples that were
+			 * aiming at a different clustered neighborhood.  Keep that
+			 * high-throughput packing behavior for ordinary tuples, while
+			 * preserving clustered placement boundaries when the batch has
+			 * remembered targets.
+			 */
+			if (heaptuple_clustered_target_blocks != NULL)
+			{
+				BlockNumber nextTargetBlock =
+					heaptuple_clustered_target_blocks[ndone + nthispage];
+
+				if (BlockNumberIsValid(clustered_target_block))
+				{
+					/*
+					 * Compare against the remembered clustered target, not
+					 * the actual buffer.  A full clustered neighbour may
+					 * redirect the run to the tail, where same-target tuples
+					 * should still be packed together.
+					 */
+					if (nextTargetBlock != clustered_target_block)
+						break;
+				}
+				else if (BlockNumberIsValid(nextTargetBlock))
+					break;
+			}
 
 			if (PageGetHeapFreeSpace(page) < MAXALIGN(heaptup->t_len) + saveFreeSpace)
 				break;
@@ -2640,8 +3539,18 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	}
 
 	/* copy t_self fields back to the caller's slots */
-	for (i = 0; i < ntuples; i++)
-		slots[i]->tts_tid = heaptuples[i]->t_self;
+	if (heaptuple_slot_indexes != NULL)
+	{
+		for (i = 0; i < ntuples; i++)
+			slots[heaptuple_slot_indexes[i]]->tts_tid = heaptuples[i]->t_self;
+		pfree(heaptuple_slot_indexes);
+		pfree(heaptuple_clustered_target_blocks);
+	}
+	else
+	{
+		for (i = 0; i < ntuples; i++)
+			slots[i]->tts_tid = heaptuples[i]->t_self;
+	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -3906,6 +4815,8 @@ l2:
 			{
 				/* It doesn't fit, must use RelationGetBufferForTuple. */
 				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
+												   NULL,
+												   InvalidBlockNumber,
 												   buffer, 0, NULL,
 												   &vmbuffer_new, &vmbuffer,
 												   0);

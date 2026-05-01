@@ -61,8 +61,8 @@ typedef struct RelationData
 	bool		rd_islocaltemp; /* rel is a temp rel of this session */
 	bool		rd_isnailed;	/* rel is nailed in cache */
 	bool		rd_isvalid;		/* relcache entry is valid */
-	bool		rd_indexvalid;	/* is rd_indexlist valid? (also rd_pkindex and
-								 * rd_replidindex) */
+	bool		rd_indexvalid;	/* is rd_indexlist valid? (also rd_pkindex,
+								 * rd_replidindex, and rd_clusteredindex) */
 	bool		rd_statvalid;	/* is rd_statlist valid? */
 
 	/*----------
@@ -153,6 +153,7 @@ typedef struct RelationData
 	Oid			rd_pkindex;		/* OID of (deferrable?) primary key, if any */
 	bool		rd_ispkdeferrable;	/* is rd_pkindex a deferrable PK? */
 	Oid			rd_replidindex; /* OID of replica identity index, if any */
+	Oid			rd_clusteredindex;	/* OID of clustered index, if any */
 
 	/* data managed by RelationGetStatExtList: */
 	List	   *rd_statlist;	/* list of OIDs of extended stats */
