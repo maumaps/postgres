@@ -512,9 +512,10 @@ The current staging shape keeps DELETEs from fragmenting that ordered run.  When
 append-mode osm2pgsql receives deletes for a target table, the copy thread now
 removes matching ids from the target's temporary staging table instead of
 draining the whole staging table before the DELETE.  Append-mode staging tables
-also get a temporary btree index on the delete key (`osm_id`, or the existing
-type/id key) so those temp-table deletes do not become full scans as the staged
-batch grows.  In a same-environment A/B against stock osm2pgsql on patched
+create a temporary btree index on the delete key (`osm_id`, or the existing
+type/id key) lazily, just before the first staged DELETE for that target, so
+those temp-table deletes do not become full scans as the staged batch grows.
+In a same-environment A/B against stock osm2pgsql on patched
 PostgreSQL, stock measured `1:58.33` create and `2:05.22` append, while the
 clustered import measured `1:30.30` create and `2:13.45` append.  The clustered
 run had a larger heap (`2840 MB` versus `2727 MB`) but much tighter locality:
@@ -562,15 +563,32 @@ is still slower in this run.  Raw gzip logs are under
 `/home/kom/tmp/clustered-write-osm2pgsql-read-repeats-20260501-160342/` and
 `/home/kom/tmp/clustered-write-osm2pgsql-stock-read-repeats-20260501-160927/`.
 
+The staged delete-key index is now created lazily rather than at temporary
+table creation time.  This keeps the protection against full temp-table scans
+when append DELETEs arrive, but avoids paying btree maintenance for targets
+that only receive staged inserts.  A same-input `READ_REPEATS=3` Georgia `978`
+run with the lazy index measured `1:42.58` create, `2:46.88` append,
+`2841 MB` size, warm read medians of `78.699 ms` point bbox, `163.190 ms` line
+bbox, `281.257 ms` polygon bbox, `40.450 ms` roads exact, and `1382.557 ms`
+polygon exact, with locality still tight at p95 block/span `2/2` line, `2/1`
+point, and `3/2` polygon.  The append `Reading input files` phase took `163s`,
+down from the previous repeated clustered run's `181s` but still above the
+stock run's `131s`; treat this as a modest cleanup, not the final append-cost
+fix.  The harness removed the per-variant data directory with
+`KEEP_PGDATA=false`; only the empty `$WORKDIR/pgdata` parent remains.  Raw gzip
+logs are under
+`/home/kom/tmp/clustered-write-osm2pgsql-lazy-delete-index-20260501-162417/`.
+
 The experimental osm2pgsql variant is not part of PostgreSQL.  For local
 testing, apply `osm2pgsql_cluster_during_import.patch` to a fresh osm2pgsql
 checkout and point `CLUSTERED_OSM2PGSQL` at the resulting binary.  The patch
 adds `--cluster-during-import`, creates a generated geometry-derived geohash key
 and a heap with `fillfactor=90`, stages COPY rows in per-target temporary
-tables, removes matching staged rows on append DELETEs, drains those staged rows
-ordered by the generated key, then creates and marks the clustered btree index
-before final GiST/osm_id index creation.  Append runs keep using the existing
-generated-key clustered index.
+tables, removes matching staged rows on append DELETEs using a lazily-created
+temporary delete-key index when needed, drains those staged rows ordered by the
+generated key, then creates and marks the clustered btree index before final
+GiST/osm_id index creation.  Append runs keep using the existing generated-key
+clustered index.
 
 Directly clustering the import tables with a pre-COPY GiST index on `way` was
 also tested as a negative control.  It worked functionally, but maintaining the

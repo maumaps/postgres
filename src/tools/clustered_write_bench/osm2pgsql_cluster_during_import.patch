@@ -16,7 +16,7 @@ index 232a70a..4a98592 100644
      app.add_flag("-K,--keep-coastlines", options.keep_coastlines)
          ->description("Keep coastline data (default: discard objects tagged"
 diff --git a/src/db-copy.cpp b/src/db-copy.cpp
-index 1a7dede..a5886e3 100644
+index 1a7dede..0f66444 100644
 --- a/src/db-copy.cpp
 +++ b/src/db-copy.cpp
 @@ -165,6 +165,7 @@ void db_copy_thread_t::thread_t::operator()()
@@ -70,7 +70,7 @@ index 1a7dede..a5886e3 100644
                         target->rows());
      }
 
-@@ -233,3 +245,78 @@ void db_copy_thread_t::thread_t::finish_copy()
+@@ -233,3 +245,100 @@ void db_copy_thread_t::thread_t::finish_copy()
          m_inflight.reset();
      }
  }
@@ -87,11 +87,6 @@ index 1a7dede..a5886e3 100644
 +        R"(CREATE TEMP TABLE "{}" (LIKE {} INCLUDING GENERATED) )"
 +        "ON COMMIT PRESERVE ROWS",
 +        target->ordered_copy_table(), qname);
-+    if (target->has_ordered_copy_delete_index()) {
-+        m_db_connection.exec(R"(CREATE INDEX ON "{}" ({}))",
-+                             target->ordered_copy_table(),
-+                             target->ordered_copy_delete_index_by());
-+    }
 +    m_ordered_copy_targets.push_back(target);
 +}
 +
@@ -106,10 +101,36 @@ index 1a7dede..a5886e3 100644
 +    return false;
 +}
 +
++bool db_copy_thread_t::thread_t::has_ordered_copy_delete_index(
++    std::shared_ptr<db_target_descr_t> const &target) const
++{
++    for (auto const &known : m_ordered_copy_delete_index_targets) {
++        if (target->same_copy_target(*known)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void db_copy_thread_t::thread_t::ensure_ordered_copy_delete_index(
++    std::shared_ptr<db_target_descr_t> const &target)
++{
++    if (!target->has_ordered_copy_delete_index() ||
++        has_ordered_copy_delete_index(target)) {
++        return;
++    }
++
++    m_db_connection.exec(R"(CREATE INDEX ON "{}" ({}))",
++                         target->ordered_copy_table(),
++                         target->ordered_copy_delete_index_by());
++    m_ordered_copy_delete_index_targets.push_back(target);
++}
++
 +void db_copy_thread_t::thread_t::delete_from_ordered_copy_table(
 +    db_cmd_copy_delete_t<db_deleter_by_id_t> &cmd)
 +{
 +    if (has_ordered_copy_table(cmd.target)) {
++        ensure_ordered_copy_delete_index(cmd.target);
 +        cmd.delete_data_from(fmt::format(R"("{}")",
 +                                         cmd.target->ordered_copy_table()),
 +                             m_db_connection);
@@ -120,6 +141,7 @@ index 1a7dede..a5886e3 100644
 +    db_cmd_copy_delete_t<db_deleter_by_type_and_id_t> &cmd)
 +{
 +    if (has_ordered_copy_table(cmd.target)) {
++        ensure_ordered_copy_delete_index(cmd.target);
 +        cmd.delete_data_from(fmt::format(R"("{}")",
 +                                         cmd.target->ordered_copy_table()),
 +                             m_db_connection);
@@ -150,7 +172,7 @@ index 1a7dede..a5886e3 100644
 +    }
 +}
 diff --git a/src/db-copy.hpp b/src/db-copy.hpp
-index 3a9d3f0..7b90bc8 100644
+index 3a9d3f0..95e85d7 100644
 --- a/src/db-copy.hpp
 +++ b/src/db-copy.hpp
 @@ -46,8 +46,41 @@ public:
@@ -236,13 +258,17 @@ index 3a9d3f0..7b90bc8 100644
      template <typename... ARGS>
      void add_deletable(ARGS &&...args)
      {
-@@ -293,6 +344,17 @@ private:
+@@ -293,6 +344,21 @@ private:
 
          void start_copy(std::shared_ptr<db_target_descr_t> const &target);
          void finish_copy();
 +        void ensure_ordered_copy_table(
 +            std::shared_ptr<db_target_descr_t> const &target);
 +        bool has_ordered_copy_table(
++            std::shared_ptr<db_target_descr_t> const &target) const;
++        void ensure_ordered_copy_delete_index(
++            std::shared_ptr<db_target_descr_t> const &target);
++        bool has_ordered_copy_delete_index(
 +            std::shared_ptr<db_target_descr_t> const &target) const;
 +        void delete_from_ordered_copy_table(
 +            db_cmd_copy_delete_t<db_deleter_by_id_t> &cmd);
@@ -254,11 +280,13 @@ index 3a9d3f0..7b90bc8 100644
          void delete_rows(db_cmd_copy_t *buffer);
 
          connection_params_t m_connection_params;
-@@ -300,6 +362,7 @@ private:
+@@ -300,6 +366,9 @@ private:
 
          // Target for copy operation currently ongoing.
          std::shared_ptr<db_target_descr_t> m_inflight;
 +        std::vector<std::shared_ptr<db_target_descr_t>> m_ordered_copy_targets;
++        std::vector<std::shared_ptr<db_target_descr_t>>
++            m_ordered_copy_delete_index_targets;
 
          // These are shared with the db_copy_thread_t in the main program.
          shared *m_shared;
