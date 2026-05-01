@@ -3194,6 +3194,7 @@ skip_clustered_prefix_cache:
 		Buffer		buffer;
 		HeapTuple	clustered_target_tuple = heaptuples[ndone];
 		BlockNumber clustered_target_block = InvalidBlockNumber;
+		uint32		buffer_options = options;
 		bool		all_visible_cleared = false;
 		bool		all_frozen_set = false;
 		int			nthispage;
@@ -3227,7 +3228,18 @@ skip_clustered_prefix_cache:
 		 * empty page. See all_frozen_set below.
 		 */
 		if (heaptuple_skip_clustered_target_lookup)
+		{
 			clustered_target_tuple = NULL;
+
+			/*
+			 * This COPY batch was already classified as too dense for
+			 * clustered target probing.  Do not ask the FSM for old pages
+			 * either: those pages are likely fillfactor reserve that should
+			 * stay available for future updates, and scanning them just adds
+			 * work before the dense run appends anyway.
+			 */
+			buffer_options |= HEAP_INSERT_SKIP_FSM;
+		}
 		else if (heaptuple_clustered_target_blocks != NULL)
 		{
 			clustered_target_block =
@@ -3239,7 +3251,7 @@ skip_clustered_prefix_cache:
 		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
 										   clustered_target_tuple,
 										   clustered_target_block,
-										   InvalidBuffer, options, bistate,
+										   InvalidBuffer, buffer_options, bistate,
 										   &vmbuffer, NULL,
 										   npages - npages_used);
 		page = BufferGetPage(buffer);

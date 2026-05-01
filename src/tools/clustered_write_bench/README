@@ -90,6 +90,17 @@ matching the control tail span.  At fillfactor `50`, the clustered outside-base
 span was `692` versus control `693`.  The overflow run is therefore compact
 after it leaves the old range; the large full span means "reserve rows plus
 compact tail", not scattered tail placement.
+For COPY batches that are already classified as too-hot and skip clustered
+target probing, the insert path now also skips the FSM page search.  This keeps
+those dense runs from spending time on old fillfactor-reserve pages that are
+more useful for future updates.  In a scale `1`, repeat `3`, fillfactor `50`,
+`hot_tile_count=128`, `hot_update_fraction=0.9` run, clustered insert median
+fell from `204.08 ms` to `163.53 ms` with unchanged locality shape; in the
+single-hot-key fillfactor `90` check, clustered insert median was `49.96 ms`
+versus `38.81 ms` for the control.  Raw gzip output is under
+`/home/kom/tmp/clustered-write-synthetic/skip-fsm-hot-prefix-proto-20260501-131256/`
+and
+`/home/kom/tmp/clustered-write-synthetic/skip-fsm-hot-prefix-single-20260501-131326/`.
 
 The multi-hot axis caught a COPY crash in the hot-prefix skip cleanup.  When a
 batch contained several prefixes whose per-prefix counts all exceeded
