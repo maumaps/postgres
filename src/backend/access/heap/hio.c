@@ -107,6 +107,7 @@ static void ClusteredWriteRememberReserveUse(Relation relation,
 											 HeapTuple tuple,
 											 BlockNumber targetBlock);
 static void ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
+													 HeapTuple tuple,
 													 BlockNumber targetBlock);
 static bool ClusteredWriteStoreOverflowValue(HeapClusteredWriteOverflowEntry *entry,
 											 Datum value,
@@ -404,11 +405,14 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		if (!RegProcedureIsValid(eqProcedure))
 			break;
 
-		ScanKeyInit(&skey[i],
-					i + 1,
-					BTEqualStrategyNumber,
-					eqProcedure,
-					value);
+		ScanKeyEntryInitialize(&skey[i],
+							   0,
+							   i + 1,
+							   BTEqualStrategyNumber,
+							   InvalidOid,
+							   indexRelation->rd_indcollation[i],
+							   eqProcedure,
+							   value);
 		nscankeys++;
 	}
 
@@ -509,11 +513,14 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 			get_opcode(rangeOperator) : InvalidOid;
 		if (RegProcedureIsValid(rangeProcedure))
 		{
-			ScanKeyInit(&rangeKey,
-						1,
-						BTGreaterEqualStrategyNumber,
-						rangeProcedure,
-						skey[0].sk_argument);
+			ScanKeyEntryInitialize(&rangeKey,
+								   0,
+								   1,
+								   BTGreaterEqualStrategyNumber,
+								   InvalidOid,
+								   indexRelation->rd_indcollation[0],
+								   rangeProcedure,
+								   skey[0].sk_argument);
 			scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
 								   1, 0, 0);
 			index_rescan(scan, &rangeKey, 1, NULL, 0);
@@ -538,11 +545,14 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		if (RegProcedureIsValid(rangeProcedure) &&
 			ncandidates < CLUSTERED_WRITE_MAX_HEAP_BLOCKS)
 		{
-			ScanKeyInit(&rangeKey,
-						1,
-						BTLessEqualStrategyNumber,
-						rangeProcedure,
-						skey[0].sk_argument);
+			ScanKeyEntryInitialize(&rangeKey,
+								   0,
+								   1,
+								   BTLessEqualStrategyNumber,
+								   InvalidOid,
+								   indexRelation->rd_indcollation[0],
+								   rangeProcedure,
+								   skey[0].sk_argument);
 			scan = index_beginscan(relation, indexRelation, SnapshotAny, NULL,
 								   1, 0, 0);
 			index_rescan(scan, &rangeKey, 1, NULL, 0);
@@ -578,6 +588,10 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		if (candidateFreeSpace[i] >= len)
 			targetBlocks[ntargets++] = candidates[i];
 	}
+	if (ntargets == 0 && ncandidates > 0 &&
+		clusteredCandidatesExhausted != NULL)
+		*clusteredCandidatesExhausted = true;
+
 	if (ntargets == 0)
 	{
 		/*
@@ -590,10 +604,6 @@ RelationGetClusteredTargetBlocksFromIndex(Relation relation,
 		for (int i = 0; i < ncandidates && ntargets < maxTargetBlocks; i++)
 			targetBlocks[ntargets++] = candidates[i];
 	}
-
-	if (ntargets == 0 && ncandidates > 0 &&
-		clusteredCandidatesExhausted != NULL)
-		*clusteredCandidatesExhausted = true;
 
 	return ntargets;
 }
@@ -859,21 +869,42 @@ ClusteredWriteRememberReserveUse(Relation relation, HeapTuple tuple,
 }
 
 static void
-ClusteredWriteUpdateCachedOverflowTarget(Relation relation,
+ClusteredWriteUpdateCachedOverflowTarget(Relation relation, HeapTuple tuple,
 										 BlockNumber targetBlock)
 {
 	HeapClusteredWriteCache *cache;
+	Datum		prefixValue;
+	bool		prefixIsNull;
 
 	cache = (HeapClusteredWriteCache *) relation->rd_amcache;
 	if (cache == NULL ||
-		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC)
+		cache->magic != CLUSTERED_WRITE_CACHE_MAGIC ||
+		tuple == NULL)
 		return;
 
 	for (int i = 0; i < CLUSTERED_WRITE_OVERFLOW_CACHE_ENTRIES; i++)
 	{
-		if (cache->overflowEntries[i].active &&
-			BlockNumberIsValid(cache->overflowEntries[i].overflowTargetBlock))
-			cache->overflowEntries[i].overflowTargetBlock = targetBlock;
+		HeapClusteredWriteOverflowEntry *entry = &cache->overflowEntries[i];
+		bool		equal;
+
+		if (!entry->active ||
+			!BlockNumberIsValid(entry->overflowTargetBlock))
+			continue;
+
+		prefixValue = heap_getattr(tuple, entry->overflowAttnum,
+								   relation->rd_att, &prefixIsNull);
+		if (prefixIsNull)
+			continue;
+
+		equal = DatumGetBool(OidFunctionCall2Coll(entry->overflowEqProc,
+												  entry->overflowCollation,
+												  entry->overflowValue,
+												  prefixValue));
+		if (equal)
+		{
+			entry->overflowTargetBlock = targetBlock;
+			return;
+		}
 	}
 }
 
@@ -1919,7 +1950,7 @@ loop:
 	 */
 	RelationSetTargetBlock(relation, targetBlock);
 	if (usingClusteredOverflowTarget)
-		ClusteredWriteUpdateCachedOverflowTarget(relation, targetBlock);
+		ClusteredWriteUpdateCachedOverflowTarget(relation, tuple, targetBlock);
 
 	return buffer;
 }
