@@ -1,0 +1,463 @@
+diff --git a/src/command-line-parser.cpp b/src/command-line-parser.cpp
+index 232a70a..4a98592 100644
+--- a/src/command-line-parser.cpp
++++ b/src/command-line-parser.cpp
+@@ -386,6 +386,12 @@ options_t parse_command_line(int argc, char *argv[])
+                       "the columns.")
+         ->group("Pgsql output options");
+
++    // --cluster-during-import
++    app.add_flag("--cluster-during-import", options.cluster_during_import)
++        ->description("Experimental: create a clustered geometry-derived key before "
++                      "loading rows and skip the final geometry sort.")
++        ->group("Pgsql output options");
++
+     // --keep-coastlines
+     app.add_flag("-K,--keep-coastlines", options.keep_coastlines)
+         ->description("Keep coastline data (default: discard objects tagged"
+diff --git a/src/db-copy.cpp b/src/db-copy.cpp
+index 1a7dede..0f66444 100644
+--- a/src/db-copy.cpp
++++ b/src/db-copy.cpp
+@@ -165,6 +165,7 @@ void db_copy_thread_t::thread_t::operator()()
+         }
+
+         finish_copy();
++        drain_ordered_copy_tables();
+     } catch (std::runtime_error const &e) {
+         log_error("DB copy thread failed: {}", e.what());
+         std::exit(2); // NOLINT(concurrency-mt-unsafe)
+@@ -177,6 +178,9 @@ bool db_copy_thread_t::thread_t::execute(db_cmd_copy_delete_t<DELETER> &cmd)
+     if (cmd.has_deletables() ||
+         (m_inflight && !cmd.target->same_copy_target(*m_inflight))) {
+         finish_copy();
++        if (cmd.has_deletables() && cmd.target->uses_ordered_copy()) {
++            delete_from_ordered_copy_table(cmd);
++        }
+     }
+
+     cmd.delete_data(m_db_connection);
+@@ -199,6 +203,7 @@ bool db_copy_thread_t::thread_t::execute(db_cmd_end_copy_t &)
+ bool db_copy_thread_t::thread_t::execute(db_cmd_sync_t &cmd)
+ {
+     finish_copy();
++    drain_ordered_copy_tables();
+     cmd.barrier.set_value();
+     return false;
+ }
+@@ -209,14 +214,21 @@ void db_copy_thread_t::thread_t::start_copy(
+     assert(!m_inflight);
+
+     auto const qname = qualified_name(target->schema(), target->name());
++    auto copy_name = qname;
++
++    if (target->uses_ordered_copy()) {
++        ensure_ordered_copy_table(target);
++        copy_name = fmt::format(R"("{}")", target->ordered_copy_table());
++    }
++
+     fmt::memory_buffer sql;
+-    sql.reserve(qname.size() + target->rows().size() + 20);
++    sql.reserve(copy_name.size() + target->rows().size() + 20);
+     if (target->rows().empty()) {
+         fmt::format_to(std::back_inserter(sql),
+-                       FMT_STRING("COPY {} FROM STDIN"), qname);
++                       FMT_STRING("COPY {} FROM STDIN"), copy_name);
+     } else {
+         fmt::format_to(std::back_inserter(sql),
+-                       FMT_STRING("COPY {} ({}) FROM STDIN"), qname,
++                       FMT_STRING("COPY {} ({}) FROM STDIN"), copy_name,
+                        target->rows());
+     }
+
+@@ -233,3 +245,100 @@ void db_copy_thread_t::thread_t::finish_copy()
+         m_inflight.reset();
+     }
+ }
++
++void db_copy_thread_t::thread_t::ensure_ordered_copy_table(
++    std::shared_ptr<db_target_descr_t> const &target)
++{
++    if (has_ordered_copy_table(target)) {
++        return;
++    }
++
++    auto const qname = qualified_name(target->schema(), target->name());
++    m_db_connection.exec(
++        R"(CREATE TEMP TABLE "{}" (LIKE {} INCLUDING GENERATED) )"
++        "ON COMMIT PRESERVE ROWS",
++        target->ordered_copy_table(), qname);
++    m_ordered_copy_targets.push_back(target);
++}
++
++bool db_copy_thread_t::thread_t::has_ordered_copy_table(
++    std::shared_ptr<db_target_descr_t> const &target) const
++{
++    for (auto const &known : m_ordered_copy_targets) {
++        if (target->same_copy_target(*known)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool db_copy_thread_t::thread_t::has_ordered_copy_delete_index(
++    std::shared_ptr<db_target_descr_t> const &target) const
++{
++    for (auto const &known : m_ordered_copy_delete_index_targets) {
++        if (target->same_copy_target(*known)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void db_copy_thread_t::thread_t::ensure_ordered_copy_delete_index(
++    std::shared_ptr<db_target_descr_t> const &target)
++{
++    if (!target->has_ordered_copy_delete_index() ||
++        has_ordered_copy_delete_index(target)) {
++        return;
++    }
++
++    m_db_connection.exec(R"(CREATE INDEX ON "{}" ({}))",
++                         target->ordered_copy_table(),
++                         target->ordered_copy_delete_index_by());
++    m_ordered_copy_delete_index_targets.push_back(target);
++}
++
++void db_copy_thread_t::thread_t::delete_from_ordered_copy_table(
++    db_cmd_copy_delete_t<db_deleter_by_id_t> &cmd)
++{
++    if (has_ordered_copy_table(cmd.target)) {
++        ensure_ordered_copy_delete_index(cmd.target);
++        cmd.delete_data_from(fmt::format(R"("{}")",
++                                         cmd.target->ordered_copy_table()),
++                             m_db_connection);
++    }
++}
++
++void db_copy_thread_t::thread_t::delete_from_ordered_copy_table(
++    db_cmd_copy_delete_t<db_deleter_by_type_and_id_t> &cmd)
++{
++    if (has_ordered_copy_table(cmd.target)) {
++        ensure_ordered_copy_delete_index(cmd.target);
++        cmd.delete_data_from(fmt::format(R"("{}")",
++                                         cmd.target->ordered_copy_table()),
++                             m_db_connection);
++    }
++}
++
++void db_copy_thread_t::thread_t::drain_ordered_copy_table(
++    std::shared_ptr<db_target_descr_t> const &target)
++{
++    if (!has_ordered_copy_table(target)) {
++        return;
++    }
++
++    auto const qname = qualified_name(target->schema(), target->name());
++
++    m_db_connection.exec(
++        R"(INSERT INTO {} ({}) SELECT {} FROM "{}" ORDER BY {})", qname,
++        target->rows(), target->rows(), target->ordered_copy_table(),
++        target->ordered_copy_by());
++    m_db_connection.exec(R"(TRUNCATE TABLE "{}")",
++                         target->ordered_copy_table());
++}
++
++void db_copy_thread_t::thread_t::drain_ordered_copy_tables()
++{
++    for (auto const &target : m_ordered_copy_targets) {
++        drain_ordered_copy_table(target);
++    }
++}
+diff --git a/src/db-copy.hpp b/src/db-copy.hpp
+index 3a9d3f0..95e85d7 100644
+--- a/src/db-copy.hpp
++++ b/src/db-copy.hpp
+@@ -46,8 +46,41 @@ public:
+     std::string const &name() const noexcept { return m_name; }
+     std::string const &id() const noexcept { return m_id; }
+     std::string const &rows() const noexcept { return m_rows; }
++    std::string const &ordered_copy_by() const noexcept
++    {
++        return m_ordered_copy_by;
++    }
++    std::string const &ordered_copy_table() const noexcept
++    {
++        return m_ordered_copy_table;
++    }
++    std::string const &ordered_copy_delete_index_by() const noexcept
++    {
++        return m_ordered_copy_delete_index_by;
++    }
+
+     void set_rows(std::string rows) { m_rows = std::move(rows); }
++    void set_ordered_copy_by(std::string order_by)
++    {
++        m_ordered_copy_by = std::move(order_by);
++    }
++    void set_ordered_copy_table(std::string table)
++    {
++        m_ordered_copy_table = std::move(table);
++    }
++    void set_ordered_copy_delete_index_by(std::string columns)
++    {
++        m_ordered_copy_delete_index_by = std::move(columns);
++    }
++
++    bool uses_ordered_copy() const noexcept
++    {
++        return !m_ordered_copy_by.empty();
++    }
++    bool has_ordered_copy_delete_index() const noexcept
++    {
++        return !m_ordered_copy_delete_index_by.empty();
++    }
+
+     /**
+      * Check if the buffer would use exactly the same copy operation.
+@@ -56,7 +89,11 @@ public:
+     {
+         return (this == &other) ||
+                (m_schema == other.m_schema && m_name == other.m_name &&
+-                m_id == other.m_id && m_rows == other.m_rows);
++                m_id == other.m_id && m_rows == other.m_rows &&
++                m_ordered_copy_by == other.m_ordered_copy_by &&
++                m_ordered_copy_table == other.m_ordered_copy_table &&
++                m_ordered_copy_delete_index_by ==
++                    other.m_ordered_copy_delete_index_by);
+     }
+
+ private:
+@@ -68,6 +105,12 @@ private:
+     std::string m_id;
+     /// Comma-separated list of rows for copy operation (when empty: all rows)
+     std::string m_rows;
++    /// Optional ORDER BY clause for a temporary staged COPY before insertion.
++    std::string m_ordered_copy_by;
++    /// Temporary table name used for staged ordered COPY.
++    std::string m_ordered_copy_table;
++    /// Optional index columns for fast DELETEs from a staged COPY table.
++    std::string m_ordered_copy_delete_index_by;
+ };
+
+ /**
+@@ -196,6 +239,14 @@ public:
+         }
+     }
+
++    void delete_data_from(std::string const &table,
++                          pg_conn_t const &db_connection)
++    {
++        if (m_deleter.has_data()) {
++            m_deleter.delete_rows(table, target->id(), db_connection);
++        }
++    }
++
+     template <typename... ARGS>
+     void add_deletable(ARGS &&...args)
+     {
+@@ -293,6 +344,21 @@ private:
+
+         void start_copy(std::shared_ptr<db_target_descr_t> const &target);
+         void finish_copy();
++        void ensure_ordered_copy_table(
++            std::shared_ptr<db_target_descr_t> const &target);
++        bool has_ordered_copy_table(
++            std::shared_ptr<db_target_descr_t> const &target) const;
++        void ensure_ordered_copy_delete_index(
++            std::shared_ptr<db_target_descr_t> const &target);
++        bool has_ordered_copy_delete_index(
++            std::shared_ptr<db_target_descr_t> const &target) const;
++        void delete_from_ordered_copy_table(
++            db_cmd_copy_delete_t<db_deleter_by_id_t> &cmd);
++        void delete_from_ordered_copy_table(
++            db_cmd_copy_delete_t<db_deleter_by_type_and_id_t> &cmd);
++        void drain_ordered_copy_table(
++            std::shared_ptr<db_target_descr_t> const &target);
++        void drain_ordered_copy_tables();
+         void delete_rows(db_cmd_copy_t *buffer);
+
+         connection_params_t m_connection_params;
+@@ -300,6 +366,9 @@ private:
+
+         // Target for copy operation currently ongoing.
+         std::shared_ptr<db_target_descr_t> m_inflight;
++        std::vector<std::shared_ptr<db_target_descr_t>> m_ordered_copy_targets;
++        std::vector<std::shared_ptr<db_target_descr_t>>
++            m_ordered_copy_delete_index_targets;
+
+         // These are shared with the db_copy_thread_t in the main program.
+         shared *m_shared;
+diff --git a/src/options.hpp b/src/options.hpp
+index 4f56bfb..4cc115b 100644
+--- a/src/options.hpp
++++ b/src/options.hpp
+@@ -136,6 +136,9 @@ struct options_t
+
+     bool enable_hstore_index = false; ///< add an index on the hstore column
+
++    /// create a clustered btree index over a generated geometry key before the first COPY
++    bool cluster_during_import = false;
++
+     /// Output multi-geometries intead of several simple geometries
+     bool enable_multi = false;
+
+diff --git a/src/output-pgsql.cpp b/src/output-pgsql.cpp
+index 6b250a6..4b38667 100644
+--- a/src/output-pgsql.cpp
++++ b/src/output-pgsql.cpp
+@@ -511,7 +511,8 @@ output_pgsql_t::output_pgsql_t(std::shared_ptr<middle_query_t> const &mid,
+         m_tables.at(i) = std::make_unique<table_t>(
+             name, type, columns, options.hstore_columns,
+             options.projection->target_srs(), options.append,
+-            options.hstore_mode, copy_thread, options.output_dbschema);
++            options.hstore_mode, copy_thread, options.output_dbschema,
++            options.cluster_during_import);
+     }
+ }
+
+diff --git a/src/table.cpp b/src/table.cpp
+index 6b65eb9..6794fe5 100644
+--- a/src/table.cpp
++++ b/src/table.cpp
+@@ -27,10 +27,11 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
+                  hstores_t hstore_columns, int const srid, bool const append,
+                  hstore_column hstore_mode,
+                  std::shared_ptr<db_copy_thread_t> const &copy_thread,
+-                 std::string const &schema)
++                 std::string const &schema, bool const cluster_during_import)
+ : m_target(std::make_shared<db_target_descr_t>(schema, name, "osm_id")),
+   m_type(std::move(type)), m_srid(fmt::to_string(srid)), m_append(append),
+-  m_hstore_mode(hstore_mode), m_columns(std::move(columns)),
++  m_hstore_mode(hstore_mode), m_cluster_during_import(cluster_during_import),
++  m_columns(std::move(columns)),
+   m_hstore_columns(std::move(hstore_columns)), m_copy(copy_thread)
+ {
+     // if we dont have any columns
+@@ -39,13 +40,23 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
+     }
+
+     generate_copy_column_list();
++
++    if (m_cluster_during_import) {
++        m_target->set_ordered_copy_by("osm2pgsql_cluster_key, osm_id");
++        m_target->set_ordered_copy_table("osm2pgsql_ordered_copy_" + name);
++        if (m_append) {
++            m_target->set_ordered_copy_delete_index_by(m_target->id());
++        }
++    }
+ }
+
+ table_t::table_t(table_t const &other,
+                  std::shared_ptr<db_copy_thread_t> const &copy_thread)
+ : m_connection_params(other.m_connection_params), m_target(other.m_target),
+   m_type(other.m_type), m_srid(other.m_srid), m_append(other.m_append),
+-  m_hstore_mode(other.m_hstore_mode), m_columns(other.m_columns),
++  m_hstore_mode(other.m_hstore_mode),
++  m_cluster_during_import(other.m_cluster_during_import),
++  m_columns(other.m_columns),
+   m_hstore_columns(other.m_hstore_columns), m_table_space(other.m_table_space),
+   m_copy(copy_thread)
+ {
+@@ -118,12 +129,28 @@ void table_t::start(connection_params_t const &connection_params,
+             sql += "\"tags\" hstore,";
+         }
+
+-        sql += fmt::format("way geometry({},{}) )", m_type, m_srid);
++        sql += fmt::format("way geometry({},{})", m_type, m_srid);
++
++        if (m_cluster_during_import) {
++            sql +=
++                ", osm2pgsql_cluster_key text COLLATE \"C\" "
++                "GENERATED ALWAYS AS "
++                "(ST_GeoHash(ST_Transform(ST_Envelope(way), 4326), 7)) "
++                "STORED";
++        }
++
++        sql += " )";
+
+         // The final tables are created with CREATE TABLE AS ... SELECT * FROM ...
+         // This means that they won't get this autovacuum setting, so it doesn't
+-        // doesn't need to be RESET on these tables
+-        sql += " WITH (autovacuum_enabled = off)";
++        // doesn't need to be RESET on these tables.  Clustered import keeps the
++        // first heap layout, so leave room for later diff rows in the same key
++        // ranges instead of filling all clustered pages during COPY.
++        if (m_cluster_during_import) {
++            sql += " WITH (autovacuum_enabled = off, fillfactor = 90)";
++        } else {
++            sql += " WITH (autovacuum_enabled = off)";
++        }
+         //add the main table space
+         sql += m_table_space;
+
+@@ -190,17 +217,38 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
+                                     m_target->name());
+         }
+
+-        log_info("Clustering table '{}' by geometry...", m_target->name());
++        if (m_cluster_during_import) {
++            log_info("Keeping ordered staged COPY heap for table '{}'.",
++                     m_target->name());
++            auto const idx_name = m_target->name() + "_cluster_key_idx";
++            auto const quoted_idx_name = fmt::format(R"("{}")", idx_name);
+
+-        std::string const sql =
+-            fmt::format("CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
+-                        qual_tmp_name, m_table_space, qual_name);
++            check_identifier(idx_name, "index names");
++            log_info("Creating clustered geometry key index on table '{}'...",
++                     m_target->name());
++            m_db_connection->exec(
++                "CREATE INDEX {} ON {} USING BTREE "
++                "(osm2pgsql_cluster_key) {}",
++                quoted_idx_name, qual_name,
++                tablespace_clause(table_space_index));
+
+-        m_db_connection->exec(sql);
++            log_info("Remembering clustered geometry key order for table '{}'...",
++                     m_target->name());
++            m_db_connection->exec("CLUSTER {} USING {}", qual_name,
++                                  quoted_idx_name);
++        } else {
++            log_info("Clustering table '{}' by geometry...", m_target->name());
++
++            std::string const sql = fmt::format(
++                "CREATE TABLE {} {} AS SELECT * FROM {} ORDER BY way",
++                qual_tmp_name, m_table_space, qual_name);
+
+-        m_db_connection->exec("DROP TABLE {}", qual_name);
+-        m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")", qual_tmp_name,
+-                              m_target->name());
++            m_db_connection->exec(sql);
++
++            m_db_connection->exec("DROP TABLE {}", qual_name);
++            m_db_connection->exec(R"(ALTER TABLE {} RENAME TO "{}")",
++                                  qual_tmp_name, m_target->name());
++        }
+
+         log_info("Creating geometry index on table '{}'...", m_target->name());
+
+diff --git a/src/table.hpp b/src/table.hpp
+index db0f73f..122e1b5 100644
+--- a/src/table.hpp
++++ b/src/table.hpp
+@@ -32,7 +32,7 @@ public:
+             hstores_t hstore_columns, int srid, bool append,
+             hstore_column hstore_mode,
+             std::shared_ptr<db_copy_thread_t> const &copy_thread,
+-            std::string const &schema);
++            std::string const &schema, bool cluster_during_import);
+
+     table_t(table_t const &other,
+             std::shared_ptr<db_copy_thread_t> const &copy_thread);
+@@ -77,6 +77,7 @@ private:
+     std::string m_srid;
+     bool m_append;
+     hstore_column m_hstore_mode;
++    bool m_cluster_during_import;
+     columns_t m_columns;
+     hstores_t m_hstore_columns;
+     std::string m_table_space;

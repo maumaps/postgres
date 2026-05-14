@@ -835,6 +835,7 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
 	foreach(index, RelationGetIndexList(rel))
 	{
 		Oid			thisIndexOid = lfirst_oid(index);
+		bool		dirty = false;
 
 		indexTuple = SearchSysCacheCopy1(INDEXRELID,
 										 ObjectIdGetDatum(thisIndexOid));
@@ -849,7 +850,7 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
 		if (indexForm->indisclustered)
 		{
 			indexForm->indisclustered = false;
-			CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+			dirty = true;
 		}
 		else if (thisIndexOid == indexOid)
 		{
@@ -857,7 +858,19 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
 			if (!indexForm->indisvalid)
 				elog(ERROR, "cannot cluster on invalid index %u", indexOid);
 			indexForm->indisclustered = true;
+			dirty = true;
+		}
+
+		if (dirty)
+		{
 			CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+
+			/*
+			 * The table relcache remembers the clustered index OID, so all
+			 * sessions must refresh it before later heap insertions consult
+			 * clustered-write placement.
+			 */
+			CacheInvalidateRelcache(rel);
 		}
 
 		InvokeObjectPostAlterHookArg(IndexRelationId, thisIndexOid, 0,

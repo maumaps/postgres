@@ -103,11 +103,213 @@ WHERE pg_class.oid=indexrelid
 	AND pg_class_2.relname = 'clstr_tst'
 	AND indisclustered;
 
+-- Verify that clustered writes may use a small number of fillfactor-reserve
+-- neighbors for a clustered key, but longer equal-prefix overflow is
+-- redirected to the tail.
+CREATE TABLE clstr_write_btree (id int, k int, filler text) WITH (fillfactor = 10);
+INSERT INTO clstr_write_btree
+SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_btree_k_id ON clstr_write_btree (k, id);
+CLUSTER clstr_write_btree USING clstr_write_btree_k_id;
+INSERT INTO clstr_write_btree
+SELECT 1000 + g, 1, repeat('y', 10)
+FROM generate_series(1, 9) AS g;
+SELECT id, tid_block(new_row.ctid) <=
+	(SELECT max(tid_block(ctid)) FROM clstr_write_btree WHERE k = 1 AND id <= 400)
+	AS used_clustered_key_reserve
+FROM clstr_write_btree AS new_row
+WHERE id BETWEEN 1001 AND 1009
+ORDER BY id;
+DROP TABLE clstr_write_btree;
+
+-- Verify that by-reference clustered keys use the same bounded overflow path.
+CREATE TABLE clstr_write_text_overflow (id int, k text COLLATE "C", filler text) WITH (fillfactor = 10);
+INSERT INTO clstr_write_text_overflow
+SELECT g, CASE WHEN g <= 200 THEN 'a' ELSE 'b' END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_text_overflow_k_id ON clstr_write_text_overflow (k, id);
+CLUSTER clstr_write_text_overflow USING clstr_write_text_overflow_k_id;
+INSERT INTO clstr_write_text_overflow
+SELECT 1000 + g, 'a', repeat('y', 10)
+FROM generate_series(1, 9) AS g;
+SELECT id, tid_block(new_row.ctid) <=
+	(SELECT max(tid_block(ctid)) FROM clstr_write_text_overflow WHERE k = 'a' AND id <= 400)
+	AS used_clustered_key_reserve
+FROM clstr_write_text_overflow AS new_row
+WHERE id BETWEEN 1001 AND 1009
+ORDER BY id;
+DROP TABLE clstr_write_text_overflow;
+
+-- Verify that reordered clustered COPY batches keep each slot's TID.
+CREATE TABLE clstr_write_copy_tid (id int, k int, filler text) WITH (fillfactor = 10);
+INSERT INTO clstr_write_copy_tid
+SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_copy_tid_k_id ON clstr_write_copy_tid (k, id);
+CREATE INDEX clstr_write_copy_tid_id ON clstr_write_copy_tid (id);
+CLUSTER clstr_write_copy_tid USING clstr_write_copy_tid_k_id;
+COPY clstr_write_copy_tid (id, k, filler) FROM stdin;
+2001	2	y
+1001	1	y
+2002	2	y
+1002	1	y
+\.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id FROM (
+	SELECT id FROM clstr_write_copy_tid WHERE id = 1001
+	UNION ALL
+	SELECT id FROM clstr_write_copy_tid WHERE id = 1002
+	UNION ALL
+	SELECT id FROM clstr_write_copy_tid WHERE id = 2001
+	UNION ALL
+	SELECT id FROM clstr_write_copy_tid WHERE id = 2002
+) AS indexed_lookup
+ORDER BY id;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+DROP TABLE clstr_write_copy_tid;
+
+-- Verify clustered COPY packing stops at clustered target boundaries.
+CREATE TABLE clstr_write_copy_boundaries (id int, k int, filler text) WITH (fillfactor = 90);
+INSERT INTO clstr_write_copy_boundaries
+SELECT g, ((g - 1) % 32) + 1, repeat('x', 64)
+FROM generate_series(1, 1600) AS g;
+CREATE INDEX clstr_write_copy_boundaries_k_id ON clstr_write_copy_boundaries (k, id);
+CLUSTER clstr_write_copy_boundaries USING clstr_write_copy_boundaries_k_id;
+CREATE TEMP TABLE clstr_write_copy_boundaries_base AS
+SELECT k, min(tid_block(ctid)) AS min_block, max(tid_block(ctid)) AS max_block
+FROM clstr_write_copy_boundaries
+GROUP BY k;
+COPY clstr_write_copy_boundaries (id, k, filler) FROM stdin;
+100001	1	y
+100002	2	y
+100003	3	y
+100004	4	y
+100005	5	y
+100006	6	y
+100007	7	y
+100008	8	y
+100009	9	y
+100010	10	y
+100011	11	y
+100012	12	y
+100013	13	y
+100014	14	y
+100015	15	y
+100016	16	y
+\.
+SELECT count(*) FILTER (WHERE tid_block(c.ctid) BETWEEN b.min_block AND b.max_block) AS inside,
+       count(*) AS total,
+       bool_and(tid_block(c.ctid) BETWEEN b.min_block AND b.max_block) AS all_inside
+FROM clstr_write_copy_boundaries AS c
+JOIN clstr_write_copy_boundaries_base AS b USING (k)
+WHERE c.id >= 100001;
+DROP TABLE clstr_write_copy_boundaries;
+DROP TABLE clstr_write_copy_boundaries_base;
+
+-- Verify mixed generated text clustered COPY batches use the prefix cache safely.
+CREATE TABLE clstr_write_text_copy_boundaries (
+	id int PRIMARY KEY,
+	tile_id int,
+	cluster_key text COLLATE "C" GENERATED ALWAYS AS ('g' || lpad(tile_id::text, 8, '0')) STORED,
+	filler text
+) WITH (fillfactor = 90);
+INSERT INTO clstr_write_text_copy_boundaries (id, tile_id, filler)
+SELECT g, ((g - 1) % 32) + 1, repeat('x', 64)
+FROM generate_series(1, 1600) AS g;
+CREATE INDEX clstr_write_text_copy_boundaries_cluster ON clstr_write_text_copy_boundaries (cluster_key);
+CLUSTER clstr_write_text_copy_boundaries USING clstr_write_text_copy_boundaries_cluster;
+CREATE TEMP TABLE clstr_write_text_copy_boundaries_base AS
+SELECT cluster_key, min(tid_block(ctid)) AS min_block, max(tid_block(ctid)) AS max_block
+FROM clstr_write_text_copy_boundaries
+GROUP BY cluster_key;
+COPY clstr_write_text_copy_boundaries (id, tile_id, filler) FROM stdin;
+100001	1	y
+100002	2	y
+100003	3	y
+100004	4	y
+100005	5	y
+100006	6	y
+100007	7	y
+100008	8	y
+100009	9	y
+100010	10	y
+100011	11	y
+100012	12	y
+100013	13	y
+100014	14	y
+100015	15	y
+100016	16	y
+\.
+SELECT count(*) FILTER (WHERE tid_block(c.ctid) BETWEEN b.min_block AND b.max_block) AS inside,
+       count(*) AS total,
+       bool_and(tid_block(c.ctid) BETWEEN b.min_block AND b.max_block) AS all_inside
+FROM clstr_write_text_copy_boundaries AS c
+JOIN clstr_write_text_copy_boundaries_base AS b USING (cluster_key)
+WHERE c.id >= 100001;
+DROP TABLE clstr_write_text_copy_boundaries;
+DROP TABLE clstr_write_text_copy_boundaries_base;
+
+-- Verify all-equal clustered COPY batches also work with generated text keys.
+CREATE TABLE clstr_write_text_key (
+	id int PRIMARY KEY,
+	tile_id int,
+	cluster_key text COLLATE "C" GENERATED ALWAYS AS ('g' || lpad(tile_id::text, 8, '0')) STORED,
+	filler text
+) WITH (fillfactor = 10);
+INSERT INTO clstr_write_text_key (id, tile_id, filler)
+SELECT g, CASE WHEN g <= 200 THEN 1 ELSE 2 END, repeat('x', 10)
+FROM generate_series(1, 400) AS g;
+CREATE INDEX clstr_write_text_key_cluster ON clstr_write_text_key (cluster_key);
+CLUSTER clstr_write_text_key USING clstr_write_text_key_cluster;
+COPY clstr_write_text_key (id, tile_id, filler) FROM stdin;
+1001	1	y
+1002	1	y
+1003	1	y
+1004	1	y
+1005	1	y
+1006	1	y
+1007	1	y
+1008	1	y
+1009	1	y
+1010	1	y
+1011	1	y
+1012	1	y
+1013	1	y
+1014	1	y
+1015	1	y
+1016	1	y
+1017	1	y
+1018	1	y
+1019	1	y
+1020	1	y
+\.
+SELECT count(*) AS copied,
+       count(*) FILTER (WHERE cluster_key = 'g00000001') AS generated_keys
+FROM clstr_write_text_key
+WHERE id >= 1001;
+DROP TABLE clstr_write_text_key;
+
+-- Verify that clustered writes do not break other clusterable AMs.
+CREATE TABLE clstr_write_gist (id int, p point, filler text) WITH (fillfactor = 50);
+INSERT INTO clstr_write_gist
+SELECT g, point(g, g), repeat('x', 1000)
+FROM generate_series(1, 20) AS g;
+CREATE INDEX clstr_write_gist_p ON clstr_write_gist USING gist (p) INCLUDE (id);
+CLUSTER clstr_write_gist USING clstr_write_gist_p;
+INSERT INTO clstr_write_gist VALUES (1001, point(1.5, 1.5), repeat('y', 1000));
+SELECT count(*) AS rows, count(*) FILTER (WHERE p <@ box(point(1, 1), point(2, 2))) AS nearby
+FROM clstr_write_gist;
+DROP TABLE clstr_write_gist;
+
 -- Verify that toast tables are clusterable
 CLUSTER pg_toast.pg_toast_826 USING pg_toast_826_index;
 
 -- Verify that clustering all tables does in fact cluster the right ones
 CREATE USER regress_clstr_user;
+GRANT CREATE ON SCHEMA public TO regress_clstr_user;
 CREATE TABLE clstr_1 (a INT PRIMARY KEY);
 CREATE TABLE clstr_2 (a INT PRIMARY KEY);
 CREATE TABLE clstr_3 (a INT PRIMARY KEY);
@@ -437,4 +639,5 @@ DROP TABLE clstr_4;
 DROP TABLE clstr_expression;
 DROP TABLE clstrpart;
 
+REVOKE CREATE ON SCHEMA public FROM regress_clstr_user;
 DROP USER regress_clstr_user;
